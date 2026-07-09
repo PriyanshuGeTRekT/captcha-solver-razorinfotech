@@ -10,6 +10,8 @@ server.log
 results.json
 user_sites.json
 run_history.json
+disabled_sites.json
+site_memory.json
 bench_*.py
 bench_*.json
 bench_*.txt

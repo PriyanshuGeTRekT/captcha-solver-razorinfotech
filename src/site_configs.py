@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field, asdict, replace, fields as dc_fields
 from pathlib import Path
 from typing import Optional
@@ -192,9 +193,13 @@ SITE_CONFIGS: dict[str, SiteFormConfig] = {
 # runs — the DOM auto-detector then supplies the field names from the live page.
 
 USER_SITES_FILE = Path("user_sites.json")
+DISABLED_SITES_FILE = Path("disabled_sites.json")
 
 # Populated from disk by load_user_sites(); domain -> SiteFormConfig.
 USER_SITES: dict[str, SiteFormConfig] = {}
+# Domains permanently removed from the active list (e.g. a built-in whose site went
+# down). The built-in code stays but the domain is hidden from get_all_configs / UI.
+DISABLED_SITES: set[str] = set()
 
 _CONFIG_FIELD_NAMES = {f.name for f in dc_fields(SiteFormConfig)}
 
@@ -292,10 +297,7 @@ def add_user_site(config: SiteFormConfig) -> SiteFormConfig:
 
 
 def remove_user_site(domain: str) -> bool:
-    """Remove a user site by domain. Returns True if something was removed.
-
-    Only user-added sites can be removed; the built-in 5 are immutable.
-    """
+    """Remove a user-added site by domain. Returns True if something was removed."""
     key = normalize_domain(domain)
     if key in USER_SITES:
         del USER_SITES[key]
@@ -304,11 +306,223 @@ def remove_user_site(domain: str) -> bool:
     return False
 
 
+def _builtin_domains() -> set[str]:
+    return {normalize_domain(d) for d in SITE_CONFIGS}
+
+
+def load_disabled_sites() -> set[str]:
+    """Load the set of permanently-removed domains from disk."""
+    DISABLED_SITES.clear()
+    try:
+        if DISABLED_SITES_FILE.exists():
+            for d in (json.loads(DISABLED_SITES_FILE.read_text(encoding="utf-8")) or []):
+                DISABLED_SITES.add(normalize_domain(d))
+    except Exception as e:
+        logger.error(f"Failed to load {DISABLED_SITES_FILE}: {e}")
+    return DISABLED_SITES
+
+
+def save_disabled_sites() -> None:
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(DISABLED_SITES_FILE.parent or "."),
+            prefix=".disabled_", suffix=".tmp", delete=False,
+        )
+        try:
+            json.dump(sorted(DISABLED_SITES), tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+        finally:
+            tmp.close()
+        Path(tmp.name).replace(DISABLED_SITES_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save {DISABLED_SITES_FILE}: {e}")
+
+
+def delete_site(domain: str) -> bool:
+    """Permanently remove a site from the active list. A user-added site is deleted
+    from the registry outright; a built-in is recorded as DISABLED (its hand-tuned
+    code stays, but the domain is hidden everywhere). Returns True if it removed one."""
+    key = normalize_domain(domain)
+    removed = False
+    if key in USER_SITES:
+        del USER_SITES[key]
+        save_user_sites()
+        removed = True
+    if key in _builtin_domains() and key not in DISABLED_SITES:
+        DISABLED_SITES.add(key)
+        save_disabled_sites()
+        removed = True
+    return removed
+
+
+def restore_site(domain: str) -> bool:
+    """Re-enable a previously-disabled built-in. Returns True if one was restored."""
+    key = normalize_domain(domain)
+    if key in DISABLED_SITES:
+        DISABLED_SITES.discard(key)
+        save_disabled_sites()
+        return True
+    return False
+
+
+def disabled_builtin_domains() -> list[str]:
+    """Built-in domains the user has removed (candidates for restore)."""
+    return sorted(DISABLED_SITES & _builtin_domains())
+
+
 def get_all_configs() -> dict[str, SiteFormConfig]:
-    """Merged view: built-in defaults overlaid with user-added/overridden sites."""
+    """Merged view: built-in defaults overlaid with user-added/overridden sites,
+    MINUS any domains the user has permanently removed."""
     merged: dict[str, SiteFormConfig] = {normalize_domain(d): c for d, c in SITE_CONFIGS.items()}
     merged.update(USER_SITES)
+    for d in DISABLED_SITES:
+        merged.pop(d, None)
     return merged
+
+
+# ============================================================
+# Learning layer — site_memory.json (a DISPOSABLE learned cache)
+# ============================================================
+#
+# After a CONFIRMED post (the client backlink actually appeared on the page), we
+# remember what worked for that site: the resolved field mapping and which captcha
+# engine solved it. Next run, learned field names fill any slot the live detector
+# missed (detector always wins — stale memory can never shadow a correct detection).
+# This is a rebuildable cache: deleting the file is a zero-impact full reset, and a
+# corrupt file degrades gracefully to today's per-run auto-detect.
+#
+# SAFETY: the SOLE writer (record_site_learning) no-ops unless the site is
+# auto_detect AND not a built-in — so the hand-tuned 5 can never receive a learned
+# byte. Writes only fire on the definitive backlink-count-increase signal.
+
+SITE_MEMORY_FILE = Path("site_memory.json")
+SITE_MEMORY: dict[str, dict] = {}          # normalized-domain -> learned entry
+MAX_MEMORY_SITES = 200
+MEMORY_FAILURE_THRESHOLD = 3               # consecutive definite rejections -> stop applying
+_MEMORY_LEARNABLE_FIELDS = [
+    "name_field", "email_field", "url_field", "city_field",
+    "message_field", "captcha_field", "captcha_hash_field", "submit_selector",
+]
+
+
+def load_site_memory() -> dict:
+    """Load the learned cache. ANY error -> start empty (it's rebuildable)."""
+    global SITE_MEMORY
+    SITE_MEMORY = {}
+    try:
+        if SITE_MEMORY_FILE.exists():
+            raw = json.loads(SITE_MEMORY_FILE.read_text(encoding="utf-8")) or {}
+            sites = raw.get("sites", {}) if isinstance(raw, dict) else {}
+            if isinstance(sites, dict):
+                SITE_MEMORY = {normalize_domain(k): v for k, v in sites.items() if isinstance(v, dict)}
+    except Exception as e:
+        logger.warning(f"site_memory load failed ({e}) — starting with an empty cache")
+        SITE_MEMORY = {}
+    return SITE_MEMORY
+
+
+def save_site_memory() -> None:
+    """Persist atomically; LRU-trim to MAX_MEMORY_SITES by last_confirmed_at."""
+    try:
+        if len(SITE_MEMORY) > MAX_MEMORY_SITES:
+            keep = sorted(SITE_MEMORY.items(),
+                          key=lambda kv: kv[1].get("last_confirmed_at", 0), reverse=True)[:MAX_MEMORY_SITES]
+            SITE_MEMORY.clear()
+            SITE_MEMORY.update(dict(keep))
+        tmp = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(SITE_MEMORY_FILE.parent or "."),
+            prefix=".sitemem_", suffix=".tmp", delete=False,
+        )
+        try:
+            json.dump({"version": 1, "sites": SITE_MEMORY}, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+        finally:
+            tmp.close()
+        Path(tmp.name).replace(SITE_MEMORY_FILE)
+    except Exception as e:
+        logger.error(f"site_memory save failed: {e}")
+
+
+def _field_sig(config: SiteFormConfig) -> str:
+    return "|".join(str(getattr(config, f, "") or "") for f in _MEMORY_LEARNABLE_FIELDS)
+
+
+def record_site_learning(config: SiteFormConfig, engine: str = "", confidence: float = 0.0,
+                         had_hash: bool = False) -> None:
+    """SOLE writer into SITE_MEMORY. NO-OP unless this is a CONFIRMED post on an
+    auto_detect (non-built-in) site. Learns the field mapping + captcha engine."""
+    if not getattr(config, "auto_detect", False):
+        return
+    key = normalize_domain(config.domain)
+    if not key or key in _builtin_domains():
+        return
+    try:
+        sig = _field_sig(config)
+        now = time.time()
+        entry = SITE_MEMORY.get(key)
+        fields = {f: (getattr(config, f, "") or "") for f in _MEMORY_LEARNABLE_FIELDS}
+        if entry is None or entry.get("field_sig") != sig:
+            # New site, or the form changed (drift): replace mapping, reset confirms.
+            entry = {
+                "domain": key, "fields": fields, "field_sig": sig,
+                "captcha": {"best_engine": "", "engines": {}, "had_hash": had_hash, "last_confidence": confidence},
+                "confirms": 0, "recent_failures": 0,
+                "created_at": (entry or {}).get("created_at", now),
+            }
+        entry["confirms"] = entry.get("confirms", 0) + 1
+        entry["recent_failures"] = 0
+        entry["updated_at"] = now
+        entry["last_confirmed_at"] = now
+        if engine:
+            engines = entry.setdefault("captcha", {}).setdefault("engines", {})
+            engines.setdefault(engine, {"confirmed": 0})["confirmed"] += 1
+            entry["captcha"]["had_hash"] = had_hash
+            entry["captcha"]["last_confidence"] = round(float(confidence or 0.0), 3)
+            entry["captcha"]["best_engine"] = max(engines.items(), key=lambda kv: kv[1].get("confirmed", 0))[0]
+        SITE_MEMORY[key] = entry
+        save_site_memory()
+        logger.info(f"Learned from confirmed post on {key}: confirms={entry['confirms']} engine={engine!r}")
+    except Exception as e:
+        logger.warning(f"record_site_learning failed for {key}: {e}")
+
+
+def record_site_failure(config: SiteFormConfig) -> None:
+    """On a DEFINITE rejection, bump recent_failures so a stale mapping self-evicts."""
+    if not getattr(config, "auto_detect", False):
+        return
+    key = normalize_domain(config.domain)
+    entry = SITE_MEMORY.get(key)
+    if entry:
+        entry["recent_failures"] = entry.get("recent_failures", 0) + 1
+        save_site_memory()
+
+
+def apply_site_memory(config: SiteFormConfig) -> SiteFormConfig:
+    """Fill EMPTY config slots from learned memory (a detector-MISS fallback). Never
+    overwrites a non-empty (user-entered or live-detected) value; skips evicted
+    entries. Returns config unchanged for built-ins (auto_detect=False)."""
+    if not getattr(config, "auto_detect", False):
+        return config
+    entry = SITE_MEMORY.get(normalize_domain(config.domain))
+    if not entry or entry.get("recent_failures", 0) >= MEMORY_FAILURE_THRESHOLD:
+        return config
+    fields = entry.get("fields", {})
+    updates = {f: fields[f] for f in _MEMORY_LEARNABLE_FIELDS
+               if fields.get(f) and not (getattr(config, f, "") or "")}
+    if updates:
+        config = replace(config, **updates)
+        logger.info(f"Applied learned mapping for {config.domain}: {list(updates)}")
+    return config
+
+
+def clear_site_memory(domain: Optional[str] = None) -> None:
+    """Wipe one site's learned memory, or all of it (domain=None)."""
+    global SITE_MEMORY
+    if domain is None:
+        SITE_MEMORY = {}
+    else:
+        SITE_MEMORY.pop(normalize_domain(domain), None)
+    save_site_memory()
 
 
 def get_config_for_url(url: str) -> Optional[SiteFormConfig]:

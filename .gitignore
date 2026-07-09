@@ -29,6 +29,8 @@ server.log
 results.json
 user_sites.json
 run_history.json
+disabled_sites.json
+site_memory.json
 *.log
 
 # OS

@@ -331,6 +331,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .addsite-msg.err { color: #993556; }
 .addsite-msg.ok { color: #0F6E56; }
 .addsite-msg.info { color: #8a8996; }
+.removed-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -6px 0 14px; }
+.removed-row .lbl { font-size: 11px; color: #b0aec2; }
+.removed-row .rchip { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: #6b6a86; background: #F1EFF9; border: 1px dashed #CECBF6; border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.removed-row .rchip:hover { background: #E7E4F5; color: #26215C; }
 .detect-panel { background: #fff; border-radius: 18px; padding: 22px; max-width: 680px; width: 100%; max-height: 88vh; overflow-y: auto; }
 .detect-panel h3 { font-size: 16px; font-weight: 700; color: #26215C; margin-bottom: 4px; }
 .detect-panel .sub { font-size: 12px; color: #8a8996; margin-bottom: 14px; word-break: break-all; }
@@ -369,6 +373,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .run-site .rs-msg { color: #9b9aa6; font-size: 11px; }
 .hist-empty { text-align: center; color: #9b9aa6; padding: 40px 16px; font-size: 13.5px; }
 .hist-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.learned { margin-top: 16px; border-top: 1px solid #EDEBF6; padding-top: 14px; }
+.learned .lh { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; color: #26215C; margin-bottom: 10px; }
+.learned .lh .g { color: #6d63d6; }
+.lrn { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: 10px; background: #FAFAFC; margin-bottom: 6px; font-size: 12px; }
+.lrn .ld { font-weight: 600; color: #26215C; flex: none; }
+.lrn .lm { color: #8a8996; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.lrn .lc { font-size: 10.5px; font-weight: 700; color: #0F6E56; background: #E1F5EE; padding: 2px 8px; border-radius: 999px; flex: none; }
+.lrn .lx { border: none; background: none; color: #b7b6c4; cursor: pointer; font-size: 15px; flex: none; padding: 0 4px; }
+.lrn .lx:hover { color: #993556; }
 .switch { position: relative; display: inline-flex; width: 38px; height: 22px; margin-left: auto; flex: none; }
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
 .switch .slider { position: absolute; inset: 0; background: #CFCDda; border-radius: 999px; transition: background 0.2s; }
@@ -477,6 +490,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
                 <button class="btn-mini primary" id="btn-add" onclick="addSite()">Add</button>
             </div>
             <div class="addsite-msg info" id="addsite-msg">Paste a guestbook or comment-form URL. We auto-detect the fields &amp; captcha.</div>
+            <div class="removed-row" id="removed-sites"></div>
             <div class="sublabel">Your backlink URL(s)</div>
             <textarea id="backlink" class="bl-input" rows="3" placeholder="https://temp.com&#10;https://another-client-site.com"></textarea>
             <div class="bl-hint">Add one URL per line &mdash; all your URLs are posted together in a single comment on each site above.</div>
@@ -513,6 +527,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
             <div class="hist-stats" id="hist-stats"></div>
             <div class="persite" id="hist-persite"></div>
             <div id="history-list"></div>
+            <div id="learned-block"></div>
             <div class="hist-actions"><button class="btn-mini" onclick="clearHistory()">Clear history</button></div>
         </div>
     </div>
@@ -605,8 +620,8 @@ function setMsg(text, cls) {
 }
 
 function siteRow(s, checked) {
-    const rm = s.builtin ? '' :
-        `<button class="rm" type="button" title="Remove site" data-domain="${esc(s.domain)}">&times;</button>`;
+    // Any site can be removed now — including a built-in whose site went down.
+    const rm = `<button class="rm" type="button" title="Remove this site" data-domain="${esc(s.domain)}">&times;</button>`;
     const tag = s.builtin ? '' : '<span class="tag">added</span>';
     return `<label class="site${checked ? '' : ' off'}">`
         + `<span class="dot" style="background:${esc(s.color)}"></span>`
@@ -627,6 +642,14 @@ async function loadSites() {
         });
         list._rmBound = true;
     }
+    const removedEl = document.getElementById('removed-sites');
+    if (removedEl && !removedEl._bound) {
+        removedEl.addEventListener('click', (e) => {
+            const chip = e.target.closest('[data-restore]');
+            if (chip) { e.preventDefault(); restoreSite(chip.getAttribute('data-restore')); }
+        });
+        removedEl._bound = true;
+    }
     // Preserve which sites the user had switched OFF across a reload.
     const prevOff = new Set(Array.from(document.querySelectorAll('.site-cb')).filter(cb => !cb.checked).map(cb => cb.dataset.url));
     const hadRows = document.querySelectorAll('.site-cb').length > 0;
@@ -634,9 +657,27 @@ async function loadSites() {
         const r = await fetch('/api/sites');
         const data = await r.json();
         list.innerHTML = (data.sites || []).map(s => siteRow(s, hadRows ? !prevOff.has(s.url) : true)).join('');
+        renderRemoved(data.removed || []);
     } catch (e) {
         list.innerHTML = '<div class="addsite-msg err">Could not load the site list.</div>';
     }
+}
+
+function renderRemoved(removed) {
+    const el = document.getElementById('removed-sites');
+    if (!el) return;
+    if (!removed.length) { el.innerHTML = ''; return; }
+    el.innerHTML = '<span class="lbl">Removed:</span> ' + removed.map(dom =>
+        '<span class="rchip" title="Restore this site" data-restore="' + esc(dom) + '">' + IC.check + ' ' + esc(dom) + '</span>'
+    ).join('');
+}
+
+async function restoreSite(domain) {
+    try {
+        const r = await fetch('/api/sites/' + encodeURIComponent(domain) + '/restore', { method: 'POST' });
+        if (r.ok) { await loadSites(); setMsg('Restored ' + esc(domain) + '.', 'ok'); }
+        else { setMsg('Could not restore ' + esc(domain) + '.', 'err'); }
+    } catch (e) { setMsg('Network error restoring site.', 'err'); }
 }
 
 async function addSite() {
@@ -749,6 +790,40 @@ async function loadHistory() {
     } catch (e) {
         document.getElementById('history-list').innerHTML = '<div class="hist-empty">Could not load history.</div>';
     }
+    loadLearned();
+}
+async function loadLearned() {
+    const el = document.getElementById('learned-block');
+    if (!el) return;
+    if (!el._bound) {
+        el.addEventListener('click', (e) => {
+            const b = e.target.closest('[data-forget]');
+            if (b) { e.preventDefault(); forgetLearned(b.getAttribute('data-forget')); }
+        });
+        el._bound = true;
+    }
+    try {
+        const r = await fetch('/api/memory');
+        const d = await r.json();
+        const mem = d.memory || [];
+        if (!mem.length) { el.innerHTML = ''; return; }
+        el.innerHTML = '<div class="learned"><div class="lh"><span class="g">'
+            + '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a5 5 0 0 0-5 5c0 1.5-1 2-1 4a4 4 0 0 0 4 4h4a4 4 0 0 0 4-4c0-2-1-2.5-1-4a5 5 0 0 0-5-5z"/><path d="M9 20h6"/><path d="M10 22h4"/></svg></span>'
+            + 'What the tool has learned from your confirmed posts</div>'
+            + mem.map(m => {
+                const f = m.fields || {};
+                const map = ['name_field', 'email_field', 'url_field', 'message_field', 'captcha_field']
+                    .map(k => f[k]).filter(Boolean).join(' · ');
+                const eng = m.best_engine ? (' · captcha: ' + esc(m.best_engine)) : '';
+                return '<div class="lrn"><span class="ld">' + esc(m.domain) + '</span>'
+                    + '<span class="lm">' + esc(map) + eng + '</span>'
+                    + '<span class="lc">' + m.confirms + '×</span>'
+                    + '<button class="lx" title="Forget this site" data-forget="' + esc(m.domain) + '">&times;</button></div>';
+            }).join('') + '</div>';
+    } catch (e) { el.innerHTML = ''; }
+}
+async function forgetLearned(domain) {
+    try { await fetch('/api/memory?domain=' + encodeURIComponent(domain), { method: 'DELETE' }); loadLearned(); } catch (e) {}
 }
 function renderHistory(d) {
     const s = d.stats || {};
@@ -908,10 +983,38 @@ async def clear_history():
     return {"status": "ok"}
 
 
+@app.get("/api/memory")
+async def get_memory():
+    """What the tool has LEARNED per site (field mappings + captcha engine)."""
+    from src.site_configs import SITE_MEMORY
+    items = []
+    for dom, e in SITE_MEMORY.items():
+        items.append({
+            "domain": dom,
+            "confirms": e.get("confirms", 0),
+            "recent_failures": e.get("recent_failures", 0),
+            "fields": e.get("fields", {}),
+            "best_engine": e.get("captcha", {}).get("best_engine", ""),
+            "had_hash": e.get("captcha", {}).get("had_hash", False),
+            "last_confirmed_at": e.get("last_confirmed_at", 0),
+        })
+    items.sort(key=lambda x: x["last_confirmed_at"], reverse=True)
+    return {"memory": items}
+
+
+@app.delete("/api/memory")
+async def clear_memory(domain: str | None = None):
+    """Wipe learned memory for one site (?domain=...) or all of it."""
+    from src.site_configs import clear_site_memory
+    clear_site_memory(domain)
+    return {"status": "ok"}
+
+
 @app.get("/api/sites")
 async def list_sites():
-    """Merged list of built-in + user-added target sites for the UI."""
-    from src.site_configs import get_all_configs, SITE_CONFIGS, normalize_domain
+    """Merged list of built-in + user-added target sites for the UI, plus any
+    built-ins the user permanently removed (so they can be restored)."""
+    from src.site_configs import get_all_configs, SITE_CONFIGS, normalize_domain, disabled_builtin_domains
     builtin_norm = {normalize_domain(d) for d in SITE_CONFIGS}
     sites = []
     for i, (domain, cfg) in enumerate(get_all_configs().items()):
@@ -922,7 +1025,7 @@ async def list_sites():
             "color": _SITE_COLORS[i % len(_SITE_COLORS)],
             "builtin": domain in builtin_norm,
         })
-    return {"sites": sites}
+    return {"sites": sites, "removed": disabled_builtin_domains()}
 
 
 @app.post("/api/sites")
@@ -941,6 +1044,11 @@ async def add_site(req: AddSiteRequest):
     if not domain:
         raise HTTPException(400, "Could not parse a domain from the URL")
     if domain in {normalize_domain(d) for d in SITE_CONFIGS}:
+        # Re-adding a built-in that was removed simply restores it.
+        from src.site_configs import restore_site
+        if restore_site(domain):
+            logger.info(f"Restored built-in site: {domain}")
+            return {"status": "ok", "domain": domain, "restored": True}
         raise HTTPException(400, f"'{domain}' is a built-in site — it's already available")
     from src.site_configs import USER_SITES
     if domain not in USER_SITES and len(USER_SITES) >= MAX_USER_SITES:
@@ -961,14 +1069,23 @@ async def add_site(req: AddSiteRequest):
 
 
 @app.delete("/api/sites/{domain}")
-async def delete_site(domain: str):
-    """Remove a user-added site. Built-in sites are immutable."""
-    from src.site_configs import remove_user_site, SITE_CONFIGS, normalize_domain
-    if normalize_domain(domain) in {normalize_domain(d) for d in SITE_CONFIGS}:
-        raise HTTPException(400, "Built-in sites can't be removed")
-    if remove_user_site(domain):
+async def remove_site_endpoint(domain: str):
+    """Permanently remove ANY site from the active list. A user-added site is
+    deleted; a built-in (e.g. one whose site went down) is disabled — its code
+    stays and it can be restored later by re-adding it."""
+    from src.site_configs import delete_site
+    if delete_site(domain):
         return {"status": "ok"}
     raise HTTPException(404, "Site not found")
+
+
+@app.post("/api/sites/{domain}/restore")
+async def restore_site_endpoint(domain: str):
+    """Restore a previously-removed built-in site."""
+    from src.site_configs import restore_site
+    if restore_site(domain):
+        return {"status": "ok"}
+    raise HTTPException(404, "That site is not in the removed list")
 
 
 @app.post("/api/sites/detect")
@@ -1524,11 +1641,17 @@ async def _process_queue():
                     if success:
                         RESULTS[idx]["status"] = "success"
                         RESULTS[idx]["message"] = f"Posted! ({config.domain})"
+                        # Learning: a CONFIRMED post (backlink appeared) teaches this
+                        # site's field mapping + winning captcha engine. No-ops for
+                        # built-ins and for weaker (non-backlink) success signals.
+                        if backlink_increased:
+                            _learn_from_confirmed(config, locals().get("solution"), locals().get("captcha_hash"))
                     else:
                         if fail_hit:
                             RESULTS[idx]["status"] = "failed"
                             RESULTS[idx]["message"] = f"Rejected by site"
                             logger.info(f"Failure detected ('{fail_hit}') for {domain}")
+                            _note_site_rejection(config)
                         else:
                             # Check if comment count increased (works for sites with no success message)
                             comment_added = False
@@ -1915,10 +2038,12 @@ async def _process_queue():
                                     RESULTS[idx]["status"] = "success"
                                     RESULTS[idx]["message"] = f"Posted! ({config.domain})"
                                     logger.info(f"Retry success (backlink confirmed) for {domain}")
+                                    _learn_from_confirmed(config, locals().get("solution"), locals().get("rr_hash") or locals().get("fresh_hash") or locals().get("captcha_hash"))
                                 elif fail_kw or yii2_has_error:
                                     RESULTS[idx]["status"] = "failed"
                                     RESULTS[idx]["message"] = "Rejected by site"
                                     logger.info(f"Retry failure: '{fail_kw or 'form error-summary'}' for {domain}")
+                                    _note_site_rejection(config)
                                 elif success_kw or yii2_no_error:
                                     RESULTS[idx]["status"] = "success"
                                     RESULTS[idx]["message"] = f"Posted! ({config.domain})"
@@ -2152,6 +2277,27 @@ async def _detect_visible_error(page) -> str:
         return ""
 
 
+def _learn_from_confirmed(config, solution, captcha_hash) -> None:
+    """Record a CONFIRMED post into the learning cache. Safe no-op for built-ins and
+    when learning is inapplicable — never raises into the submission flow."""
+    try:
+        from src.site_configs import record_site_learning
+        engine = getattr(solution, "solved_via", "") if solution is not None else ""
+        conf = getattr(solution, "confidence", 0.0) if solution is not None else 0.0
+        record_site_learning(config, engine=engine, confidence=conf, had_hash=bool(captcha_hash))
+    except Exception as e:
+        logger.debug(f"learn_from_confirmed skipped: {e}")
+
+
+def _note_site_rejection(config) -> None:
+    """Bump the learned recent_failures counter on a definite rejection (self-evict)."""
+    try:
+        from src.site_configs import record_site_failure
+        record_site_failure(config)
+    except Exception:
+        pass
+
+
 # JS run in the page to infer which inputs are name/email/url/city/message/captcha
 # on an unknown site. Scoped to the form that carries the captcha (or the last form
 # with a textarea) so login/search boxes elsewhere on the page are ignored.
@@ -2330,15 +2476,24 @@ async def _augment_config_from_dom(page, config):
             f"input[id='{submit_name}'], button[id='{submit_name}']"
         )
 
-    # Safe fallbacks so form-scoping and message fill never break on odd pages.
-    if not config.captcha_field and not updates.get("captcha_field"):
-        updates["captcha_field"] = "captcha"
-    if not config.message_field and not updates.get("message_field"):
-        updates["message_field"] = "message"
-
     new_config = replace(config, **updates) if updates else config
+
+    # Learning layer: fill any slot the LIVE detector left empty from what worked on
+    # a past confirmed post (detector always wins; memory is a fallback only).
+    from src.site_configs import apply_site_memory
+    new_config = apply_site_memory(new_config)
+
+    # Safe generic fallbacks LAST — only if still empty after detection + memory.
+    final = {}
+    if not new_config.captcha_field:
+        final["captcha_field"] = "captcha"
+    if not new_config.message_field:
+        final["message_field"] = "message"
+    if final:
+        new_config = replace(new_config, **final)
+
     logger.info(
-        f"Auto-detected fields for {new_config.domain}: "
+        f"Resolved fields for {new_config.domain}: "
         f"name={new_config.name_field!r} email={new_config.email_field!r} "
         f"url={new_config.url_field!r} msg={new_config.message_field!r} "
         f"captcha={new_config.captcha_field!r} submit={bool(new_config.submit_selector)} "
@@ -2858,12 +3013,14 @@ SCREENSHOTS_DIR.mkdir(exist_ok=True)
 _load_results()
 _load_run_history()
 
-# Load any user-added sites from disk so they merge with the built-in 5.
+# Load user-added sites, the permanently-removed set, and the learned cache.
 try:
-    from src.site_configs import load_user_sites
+    from src.site_configs import load_user_sites, load_disabled_sites, load_site_memory
     load_user_sites()
+    load_disabled_sites()
+    load_site_memory()
 except Exception as _e:
-    logger.warning(f"Could not load user sites: {_e}")
+    logger.warning(f"Could not load site registry: {_e}")
 
 
 @app.get("/screenshots/{filename}")
