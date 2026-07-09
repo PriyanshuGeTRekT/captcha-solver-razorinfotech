@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import sys
+import time
 from typing import Any, Callable, Coroutine, Optional
 
 import click
@@ -56,6 +58,7 @@ def cli(ctx: click.Context, debug: bool, config_path: Optional[str]) -> None:
 @click.option("--profile", "-p", default="default", help="Browser profile name")
 @click.option("--proxy", "-x", default=None, help="Proxy URL (e.g. socks5://user:pass@host:port)")
 @click.option("--headless", is_flag=True, help="Run browser in headless mode")
+@click.option("--keep-open", is_flag=True, help="Keep browser open after solving for manual verification")
 @async_command
 async def solve(
     url: str,
@@ -63,6 +66,7 @@ async def solve(
     profile: str,
     proxy: Optional[str],
     headless: bool,
+    keep_open: bool,
 ) -> None:
     """Detect and solve a CAPTCHA on a webpage."""
     config = get_config()
@@ -85,7 +89,7 @@ async def solve(
         browser = await get_browser(config.solver)
         pm = ProfileManager()
         router = StrategyRouter(config.solver, browser, pm)
-        solution = await router.solve(url, profile_name=profile, force_type=force_type)
+        solution = await router.solve(url, profile_name=profile, force_type=force_type, keep_open=keep_open)
 
         if solution.success:
             click.echo(f"\nSolved ({solution.solved_via}, {solution.elapsed_ms:.0f}ms, {solution.attempts} attempts)")
@@ -94,6 +98,9 @@ async def solve(
             click.echo(f"\nFailed: {solution.error}", err=True)
             sys.exit(1)
     finally:
+        if keep_open:
+            click.echo("\nBrowser kept open for manual verification. Press Enter to close...")
+            input()
         await close_browser()
 
 
@@ -121,6 +128,109 @@ async def detect(url: str) -> None:
             click.echo(f"Extra: {challenge.extra}")
     finally:
         await close_browser()
+
+
+@cli.command()
+@click.option("--url", "-u", required=True, help="Target page URL (submission form)")
+@click.option("--name", "-n", required=True, help="Name to submit")
+@click.option("--email", "-e", required=True, help="Email to submit")
+@click.option("--link", "-l", required=True, help="Backlink URL to submit")
+@click.option("--message", "-m", default="Great site, keep up the good work!", help="Message text")
+@click.option("--max-retries", default=3, help="Max captcha retries on failure")
+@click.option("--headless", is_flag=True, help="Run browser in headless mode")
+@async_command
+async def backlink(
+    url: str,
+    name: str,
+    email: str,
+    link: str,
+    message: str,
+    max_retries: int,
+    headless: bool,
+) -> None:
+    """Submit a backlink to a guestbook/comment form with captcha solving."""
+    from src.submitter import FormSubmitter, SubmissionResult
+
+    config = get_config()
+    if headless:
+        config.solver.browser_headless = True
+
+    config.solver.max_retries = max_retries
+    click.echo(f"Target: {url}")
+    click.echo(f"Backlink: {link}\n")
+
+    browser = await get_browser(config.solver)
+    pm = ProfileManager()
+    router = StrategyRouter(config.solver, browser, pm)
+
+    from src.browser import create_context
+
+    start = time.time()
+    overall_success = False
+
+    try:
+        async with create_context(browser, auto_close=False) as context:
+            page = await context.new_page()
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3.0)
+
+            submitter = FormSubmitter(page)
+            fields = await submitter.detect_fields()
+
+            click.echo(f"Detected fields: {json.dumps({k: v for k, v in fields.items() if v}, indent=2)}")
+
+            for attempt in range(1, max_retries + 1):
+                click.echo(f"\n--- Attempt {attempt}/{max_retries} ---")
+
+                # Solve captcha
+                captcha_solution = await router.solve_on_page(page, url)
+
+                if not captcha_solution.success:
+                    click.echo(f"Captcha solve failed: {captcha_solution.error}")
+                    if attempt < max_retries:
+                        click.echo("Retrying...")
+                        continue
+                    break
+
+                captcha_token = captcha_solution.token
+                click.echo(f"Captcha solved: '{captcha_token}' via {captcha_solution.solved_via}")
+
+                # Fill form
+                await submitter.fill_form(
+                    name=name,
+                    email=email,
+                    url=link,
+                    message=message,
+                    captcha_token=captcha_token,
+                    fields=fields,
+                )
+                await asyncio.sleep(0.5)
+
+                # Submit
+                result = await submitter.submit(fields=fields)
+                click.echo(f"Submit result: {'SUCCESS' if result.success else 'FAILED'}")
+
+                if result.success:
+                    click.echo(f"Response: {result.response_text[:200]}")
+                    overall_success = True
+                    break
+                else:
+                    click.echo(f"Error: {result.error}")
+                    click.echo(f"Response: {result.response_text[:200]}")
+                    if attempt < max_retries:
+                        click.echo("Captcha likely wrong, retrying...")
+                        await page.reload(wait_until="domcontentloaded")
+                        await asyncio.sleep(2.0)
+
+    finally:
+        await close_browser()
+
+    elapsed = (time.time() - start) * 1000
+    click.echo(f"\n{'SUCCESS' if overall_success else 'FAILED'} ({elapsed:.0f}ms)")
+
+    if not overall_success:
+        sys.exit(1)
 
 
 @cli.group()

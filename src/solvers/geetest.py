@@ -64,7 +64,7 @@ class GeeTestSolver(BaseSolver):
     async def _find_geetest_frame(self, page: Page) -> Optional[Frame]:
         for _ in range(5):
             for frame in page.frames:
-                if "geetest" in frame.url.lower() or "gee" in frame.url.lower():
+                if "geetest" in frame.url.lower():
                     return frame
             await asyncio.sleep(1.0)
         return None
@@ -81,8 +81,8 @@ class GeeTestSolver(BaseSolver):
             start_y = box["y"] + box["height"] / 2
 
             gap = await self._find_gap_position(page, frame)
-            if gap == 0:
-                gap = box["width"] * 4
+            if gap < 0:
+                gap = int(box["width"] * 4)
 
             await page.mouse.move(start_x, start_y)
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -103,7 +103,7 @@ class GeeTestSolver(BaseSolver):
 
             token = await page.evaluate("""
             (() => {
-                if (typeof ___grecaptcha_cfg !== 'undefined') return _grecaptcha_cfg;
+                if (typeof ___grecaptcha_cfg !== 'undefined') return ___grecaptcha_cfg;
                 const inputs = document.querySelectorAll('input[name*="geetest"], input[name*="validate"]');
                 for (const inp of inputs) {
                     if (inp.value && inp.value.length > 10) return inp.value;
@@ -119,32 +119,28 @@ class GeeTestSolver(BaseSolver):
 
     async def _find_gap_position(self, page: Page, frame: Frame) -> int:
         try:
-            bg_img = await frame.locator(".geetest_canvas_bg canvas, canvas.geetest_canvas_bg").get_attribute("src")
-            slice_img = await frame.locator(".geetest_canvas_slice canvas, canvas.geetest_canvas_slice").get_attribute("src")
-            if not bg_img:
-                bg_element = frame.locator(".geetest_canvas_bg canvas, canvas.geetest_canvas_bg")
-                bg_img = await bg_element.evaluate("el => el.toDataURL()")
+            bg_element = frame.locator(".geetest_canvas_bg canvas, canvas.geetest_canvas_bg").first
+            slice_element = frame.locator(".geetest_canvas_slice canvas, canvas.geetest_canvas_slice").first
 
-            if bg_img and slice_img:
-                import base64
-                import io
+            if await bg_element.count() > 0 and await slice_element.count() > 0:
                 import cv2
                 import numpy as np
                 from PIL import Image
+                import io
 
-                def to_cv(img_str: str) -> np.ndarray:
-                    data = img_str.split(",", 1)[1] if "," in img_str else img_str
-                    img = Image.open(io.BytesIO(base64.b64decode(data)))
-                    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+                bg_bytes = await bg_element.screenshot(type="png")
+                sl_bytes = await slice_element.screenshot(type="png")
 
-                bg = to_cv(bg_img)
-                sl = to_cv(slice_img)
+                bg = cv2.cvtColor(np.array(Image.open(io.BytesIO(bg_bytes))), cv2.COLOR_RGB2GRAY)
+                sl = cv2.cvtColor(np.array(Image.open(io.BytesIO(sl_bytes))), cv2.COLOR_RGB2GRAY)
 
                 result = cv2.matchTemplate(bg, sl, cv2.TM_CCOEFF_NORMED)
                 _, _, _, max_loc = cv2.minMaxLoc(result)
                 return max_loc[0]
-
         except Exception as e:
             logger.warning(f"gap detection failed: {e}")
 
-        return random.randint(50, 200)
+        return -1
+
+
+SolverRegistry.register(GeeTestSolver())

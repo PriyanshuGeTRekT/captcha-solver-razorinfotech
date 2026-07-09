@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import time
 import base64
-import re
+import logging
 import random
+import time
 from typing import Optional
 
 from playwright.async_api import Page, Frame
 
-from src.models import CaptchaChallenge, CaptchaSolution, CaptchaType
-from src.solvers.base import BaseSolver, SolverRegistry
+from src.models import CaptchaChallenge, CaptchaSolution, CaptchaType, RateLimitException
+from src.solvers.base import BaseSolver
 from src.solvers.audio import AudioSolver
 from src.solvers.image_classifier import ImageClassifierSolver
-from src.browser import create_context
-from src.behavior import human_click, human_type, human_mouse_move, human_prebrowse
+from src.behavior import human_click, human_mouse_move, human_prebrowse
+from src.utils.selectors import RecaptchaSelectors
+from src.utils.model_manager import ModelManager
+from src.utils.http import fetch_audio_base64_stealth
 from src.config import SolverConfig
 
 logger = logging.getLogger("captcha_solver")
@@ -24,16 +25,15 @@ logger = logging.getLogger("captcha_solver")
 class BrowserTokenSolver(BaseSolver):
     name = "browser_token"
 
-    def __init__(self, config: SolverConfig, page: Page):
+    def __init__(self, config: SolverConfig, page: Page, model_manager: ModelManager | None = None):
         self.config = config
         self.page = page
-        self._audio_solver = AudioSolver(
-            model_size=config.audio_model_size,
-            compute_type=config.audio_compute_type,
+        self.model_manager = model_manager or ModelManager(
+            whisper_model_size=config.audio_model_size,
+            clip_model_name=config.clip_model_name,
         )
-        self._image_solver = ImageClassifierSolver(
-            model_name=config.clip_model_name,
-        )
+        self._audio_solver = AudioSolver(model_manager=self.model_manager)
+        self._image_solver = ImageClassifierSolver(model_manager=self.model_manager)
 
     def can_solve(self, challenge: CaptchaChallenge) -> bool:
         return challenge.type in (
@@ -78,6 +78,8 @@ class BrowserTokenSolver(BaseSolver):
                     logger.info(f"retrying in {delay:.1f}s (attempt {attempt + 2}/{self.config.max_retries})")
                     await asyncio.sleep(delay)
 
+            except RateLimitException:
+                raise
             except Exception as e:
                 logger.warning(f"attempt {attempt + 1} failed: {e}")
 
@@ -133,6 +135,11 @@ class BrowserTokenSolver(BaseSolver):
                         return token
                     continue
 
+            if "Try again later" in body_text:
+                logger.warning("rate limited by Google, waiting 10s before retry")
+                await asyncio.sleep(10.0)
+                raise RateLimitException("Google rate limit detected")
+
             answer = await self._solve_audio_challenge(bframe)
             if not answer:
                 break
@@ -154,7 +161,7 @@ class BrowserTokenSolver(BaseSolver):
 
     async def _switch_to_audio(self, frame: Frame) -> bool:
         try:
-            audio_btn = frame.locator("#recaptcha-audio-button, button[title*='audio']").first
+            audio_btn = frame.locator(RecaptchaSelectors.AUDIO_BUTTON).first
             await audio_btn.click(timeout=5000, force=True)
             logger.info("switched to audio challenge")
             await asyncio.sleep(3.0)
@@ -211,7 +218,7 @@ class BrowserTokenSolver(BaseSolver):
 
     async def _click_checkbox(self, frame: Frame) -> None:
         try:
-            checkbox = frame.locator("#recaptcha-anchor").first
+            checkbox = frame.locator(RecaptchaSelectors.CHECKBOX).first
             await checkbox.wait_for(state="visible", timeout=10000)
             box = await checkbox.bounding_box()
             if box:
@@ -229,22 +236,11 @@ class BrowserTokenSolver(BaseSolver):
 
     async def _click_hcaptcha_checkbox(self, frame: Frame) -> None:
         try:
-            checkbox = frame.locator("#checkbox, .checkbox")
+            checkbox = frame.locator(RecaptchaSelectors.CHECKBOX_ALTERNATE)
             await human_click(frame.page, checkbox)
             logger.info("clicked hCaptcha checkbox")
         except Exception as e:
             logger.warning(f"hCaptcha checkbox click failed: {e}")
-
-    async def _wait_for_challenge(self, frame: Frame) -> bool:
-        for _ in range(5):
-            try:
-                visible = await frame.locator("#recaptcha-challenge, .rc-imageselect").is_visible()
-                if visible:
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-        return False
 
     async def _solve_audio_challenge(self, frame: Frame) -> Optional[str]:
         try:
@@ -254,7 +250,7 @@ class BrowserTokenSolver(BaseSolver):
             if "Press PLAY" in body_text or "PLAY" in body_text:
                 pass
             elif "Select all" in body_text or "Click verify" in body_text:
-                audio_btn = frame.locator("#recaptcha-audio-button, button[title*='audio']").first
+                audio_btn = frame.locator(RecaptchaSelectors.AUDIO_BUTTON).first
                 await audio_btn.click(timeout=5000, force=True)
                 logger.info("switched to audio challenge")
                 await asyncio.sleep(3.0)
@@ -263,7 +259,7 @@ class BrowserTokenSolver(BaseSolver):
                 await asyncio.sleep(10.0)
                 return None
 
-            play_btn = frame.locator("button:has-text('PLAY'), .rc-audiochallenge-play-button, .rc-button-default.goog-inline-block").first
+            play_btn = frame.locator(RecaptchaSelectors.PLAY_BUTTON).first
             await play_btn.click(timeout=8000, force=True)
             logger.info("clicked PLAY")
             await asyncio.sleep(4.0)
@@ -272,91 +268,70 @@ class BrowserTokenSolver(BaseSolver):
             logger.warning(f"audio challenge activation failed: {e}")
             return None
 
+        audio_src = await self._extract_audio_src(frame)
+        if not audio_src:
+            return None
+
+        audio_b64 = None
         try:
-            audio_src = None
-
-            all_audio = await frame.evaluate("""
-            (() => {
-                const elements = [];
-                document.querySelectorAll('audio, audio source, a[href*="mp3"], a[href*="audio"], .rc-audiochallenge-tdownload-link').forEach(el => {
-                    elements.push({tag: el.tagName, src: el.src || el.href, id: el.id, class: el.className});
-                });
-                return elements;
-            })()
-            """)
-            logger.info(f"audio elements found: {all_audio}")
-
-            for item in all_audio:
-                if item.get("src"):
-                    audio_src = item["src"]
-                    break
-
-            if not audio_src:
-                audio_el = frame.locator("audio").first
-                audio_src = await audio_el.get_attribute("src", timeout=3000)
-            if not audio_src:
-                src_el = frame.locator("audio source").first
-                audio_src = await src_el.get_attribute("src", timeout=3000)
-            if not audio_src:
-                download = frame.locator(".rc-audiochallenge-tdownload-link").first
-                audio_src = await download.get_attribute("href", timeout=3000)
-
-            if audio_src:
-                audio_b64 = await self.page.evaluate(f"""
-                (async () => {{
-                    const resp = await fetch('{audio_src}');
-                    const blob = await resp.blob();
-                    return new Promise((resolve) => {{
-                        const reader = new FileReader();
-                        reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                        reader.readAsDataURL(blob);
-                    }});
-                }})()
-                """)
-                audio_data = f"data:audio/mp3;base64,{audio_b64}"
-
-                challenge = CaptchaChallenge(
-                    type=CaptchaType.IMAGE_CAPTCHA,
-                    extra={"audio_data": audio_data},
-                )
-                solution = await self._audio_solver.solve(challenge)
-                if solution.success:
-                    logger.info(f"whisper transcribed: '{solution.token}'")
-                    return solution.token
-
-            logger.warning("audio via browser fetch failed, trying download link")
-            download_link = frame.locator(".rc-audiochallenge-tdownload-link, a[href*='audio']").first
-            href = await download_link.get_attribute("href", timeout=5000)
-            if href:
-                audio_b64 = await self.page.evaluate(f"""
-                (async () => {{
-                    const resp = await fetch('{href}');
-                    const blob = await resp.blob();
-                    return new Promise((resolve) => {{
-                        const reader = new FileReader();
-                        reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                        reader.readAsDataURL(blob);
-                    }});
-                }})()
-                """)
-                audio_data = f"data:audio/mp3;base64,{audio_b64}"
-
-                challenge = CaptchaChallenge(
-                    type=CaptchaType.IMAGE_CAPTCHA,
-                    extra={"audio_data": audio_data},
-                )
-                solution = await self._audio_solver.solve(challenge)
-                if solution.success:
-                    logger.info(f"whisper transcribed: '{solution.token}'")
-                    return solution.token
-
+            audio_b64 = await fetch_audio_base64_stealth(audio_src)
+            logger.info("audio downloaded via curl_cffi")
         except Exception as e:
-            logger.error(f"audio download/transcribe failed: {e}")
+            logger.warning(f"curl_cffi download failed: {e}, falling back to browser fetch")
+            audio_b64 = await self._fetch_audio_browser(frame, audio_src)
+
+        if not audio_b64:
+            return None
+
+        challenge = CaptchaChallenge(
+            type=CaptchaType.IMAGE_CAPTCHA,
+            extra={"audio_data": audio_b64},
+        )
+        solution = await self._audio_solver.solve(challenge)
+        if solution.success:
+            logger.info(f"whisper transcribed: '{solution.token}'")
+            return solution.token
+
+        return None
+
+    async def _extract_audio_src(self, frame: Frame) -> Optional[str]:
+        all_audio = await frame.evaluate("""
+        (() => {
+            const elements = [];
+            document.querySelectorAll('audio, audio source, a[href*="mp3"], a[href*="audio"], .rc-audiochallenge-tdownload-link').forEach(el => {
+                elements.push({tag: el.tagName, src: el.src || el.href, id: el.id, class: el.className});
+            });
+            return elements;
+        })()
+        """)
+        logger.info(f"audio elements found: {all_audio}")
+
+        for item in all_audio:
+            if item.get("src"):
+                return item["src"]
+        return None
+
+    async def _fetch_audio_browser(self, frame: Frame, audio_src: str) -> Optional[str]:
+        try:
+            audio_b64 = await self.page.evaluate(f"""
+            (async () => {{
+                const resp = await fetch('{audio_src}');
+                const blob = await resp.blob();
+                return new Promise((resolve) => {{
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                    reader.readAsDataURL(blob);
+                }});
+            }})()
+            """)
+            return f"data:audio/mp3;base64,{audio_b64}"
+        except Exception as e:
+            logger.error(f"browser audio fetch failed: {e}")
         return None
 
     async def _type_audio_answer(self, frame: Frame, answer: str) -> None:
         try:
-            input_field = frame.locator("#audio-response").first
+            input_field = frame.locator(RecaptchaSelectors.AUDIO_RESPONSE_INPUT).first
             await input_field.fill(answer, timeout=5000)
             logger.info(f"typed audio answer: {answer}")
         except Exception as e:
@@ -364,7 +339,7 @@ class BrowserTokenSolver(BaseSolver):
 
     async def _click_verify(self, frame: Frame) -> None:
         try:
-            verify_btn = frame.locator("#recaptcha-verify-button").first
+            verify_btn = frame.locator(RecaptchaSelectors.VERIFY_BUTTON).first
             await verify_btn.click(timeout=5000)
             logger.info("clicked verify")
             await asyncio.sleep(2.0)
@@ -373,28 +348,92 @@ class BrowserTokenSolver(BaseSolver):
 
     async def _solve_image_challenge(self, frame: Frame, page: Page) -> None:
         try:
-            challenge_title = await frame.locator(".rc-imageselect-desc, .rc-imageselect-desc-no-translate, strong").first.text_content(timeout=5000)
+            challenge_title = await frame.locator(
+                RecaptchaSelectors.CHALLENGE_TITLE
+            ).first.text_content(timeout=5000)
             prompt = challenge_title.strip() if challenge_title else ""
             logger.info(f"image challenge prompt: {prompt}")
         except Exception:
             prompt = ""
 
         try:
-            tiles = frame.locator(".rc-imageselect-tile, .rc-image-tile-target")
+            tiles = frame.locator(RecaptchaSelectors.TILES)
             tile_count = await tiles.count()
-            selected = 0
+            if tile_count == 0:
+                logger.warning("no image challenge tiles found")
+                return
+
+            tile_images = []
             for i in range(tile_count):
-                if selected >= tile_count // 2:
-                    break
-                tile = tiles.nth(i)
+                try:
+                    tile = tiles.nth(i)
+                    screenshot = await tile.screenshot(type="png")
+                    tile_images.append(base64.b64encode(screenshot).decode())
+                except Exception as e:
+                    logger.warning(f"tile {i} screenshot failed: {e}")
+                    tile_images.append("")
+
+            selected_indices = await self._classify_tiles(tile_images, prompt, tile_count)
+
+            if not selected_indices:
+                logger.warning("CLIP returned no matches, falling back to random")
+                selected_indices = self._fallback_tile_selection(tile_count)
+
+            logger.info(f"selected tiles: {selected_indices}")
+            for idx in sorted(selected_indices):
+                if idx >= tile_count:
+                    continue
+                tile = tiles.nth(idx)
                 await human_click(page, tile)
-                selected += 1
                 await asyncio.sleep(random.uniform(0.3, 0.8))
 
-            verify_btn = frame.locator("#recaptcha-verify-button")
+            verify_btn = frame.locator(RecaptchaSelectors.VERIFY_BUTTON)
             await human_click(page, verify_btn)
         except Exception as e:
             logger.warning(f"image challenge interaction failed: {e}")
+
+    async def _classify_tiles(
+        self, tile_images: list[str], prompt: str, tile_count: int
+    ) -> list[int]:
+        import torch
+
+        model, preprocess, tokenizer, device = self._image_solver._load_clip_model()
+        labels = self._image_solver._get_labels_for_prompt(prompt)
+        text_tokens = tokenizer(labels).to(device)
+
+        with torch.no_grad():
+            text_features = model.encode_text(text_tokens)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        selected = []
+        for idx, img_b64 in enumerate(tile_images):
+            if not img_b64:
+                continue
+            try:
+                img = self._image_solver._decode_image(img_b64)
+                tile = preprocess(img).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    image_features = model.encode_image(tile)
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                    similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+                    best_idx = similarity[0].argmax().item()
+
+                if best_idx < len(labels) - 1 and similarity[0][best_idx] > 0.15:
+                    selected.append(idx)
+                    logger.info(f"tile {idx}: {labels[best_idx]} (conf={similarity[0][best_idx]:.3f})")
+                else:
+                    logger.info(f"tile {idx}: no match (best={labels[best_idx]}, conf={similarity[0][best_idx]:.3f})")
+            except Exception as e:
+                logger.warning(f"tile {idx} classification failed: {e}")
+
+        if len(selected) < 2 and tile_count >= 6:
+            selected = self._fallback_tile_selection(tile_count)
+
+        return selected
+
+    def _fallback_tile_selection(self, tile_count: int) -> list[int]:
+        count = max(tile_count // 3, 1)
+        return random.sample(range(tile_count), min(count, tile_count))
 
     async def _extract_recaptcha_response(self, page: Page) -> Optional[str]:
         try:
@@ -468,3 +507,6 @@ class BrowserTokenSolver(BaseSolver):
         except Exception as e:
             logger.warning(f"v3 token extraction failed: {e}")
         return None
+
+
+# BrowserTokenSolver is manually constructed in router.py — not registered

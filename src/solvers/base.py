@@ -11,8 +11,9 @@ logger = logging.getLogger("captcha_solver")
 class BaseSolver(ABC):
     name: str = "base"
 
+    @abstractmethod
     async def solve(self, challenge: CaptchaChallenge) -> CaptchaSolution:
-        raise NotImplementedError
+        ...
 
     def can_solve(self, challenge: CaptchaChallenge) -> bool:
         return False
@@ -27,8 +28,13 @@ class SolverRegistry:
         logger.debug(f"registered solver: {solver.name}")
 
     @classmethod
+    def reset(cls) -> None:
+        """Clear all registered solvers. Useful for testing."""
+        cls._solvers = []
+
+    @classmethod
     def get_solvers(cls) -> list[BaseSolver]:
-        return cls._solvers
+        return list(cls._solvers)
 
     @classmethod
     def find(cls, challenge: CaptchaChallenge) -> BaseSolver | None:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-import io
 import base64
 
 from PIL import Image
@@ -10,34 +9,10 @@ import numpy as np
 
 from src.models import CaptchaChallenge, CaptchaSolution, CaptchaType
 from src.solvers.base import BaseSolver, SolverRegistry
-from src.utils.image import decode_image, crop_to_square_center
+from src.utils.image import decode_image
+from src.utils.model_manager import ModelManager
 
 logger = logging.getLogger("captcha_solver")
-
-_CLIP_MODEL = None
-_CLIP_PREPROCESS = None
-_TOKENIZER = None
-_DEVICE = "cpu"
-
-
-def _get_clip_model(model_name: str = "ViT-B-32"):
-    global _CLIP_MODEL, _CLIP_PREPROCESS, _TOKENIZER, _DEVICE
-    if _CLIP_MODEL is None:
-        try:
-            import torch
-            import open_clip
-
-            _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(f"loading CLIP model '{model_name}' on {_DEVICE}...")
-            _CLIP_MODEL, _, _CLIP_PREPROCESS = open_clip.create_model_and_transforms(model_name)
-            _TOKENIZER = open_clip.get_tokenizer(model_name)
-            _CLIP_MODEL = _CLIP_MODEL.to(_DEVICE)
-            _CLIP_MODEL.eval()
-            logger.info("CLIP ready")
-        except ImportError:
-            logger.error("open-clip-torch not installed. Run: pip install open-clip-torch")
-            raise
-    return _CLIP_MODEL, _CLIP_PREPROCESS, _TOKENIZER, _DEVICE
 
 
 COMMON_RECAPTCHA_LABELS = [
@@ -84,11 +59,22 @@ _HCAPTCHA_LABELS = [
 class ImageClassifierSolver(BaseSolver):
     name = "image_classifier"
 
-    def __init__(self, model_name: str = "ViT-B-32"):
-        self.model_name = model_name
+    def __init__(self, model_manager: ModelManager | None = None):
+        self.model_manager = model_manager or ModelManager()
+
+    def _load_clip_model(self):
+        return self.model_manager.get_clip()
+
+    @staticmethod
+    def _decode_image(data: str):
+        return decode_image(f"data:image/png;base64,{data}")
 
     def can_solve(self, challenge: CaptchaChallenge) -> bool:
-        return challenge.type == CaptchaType.IMAGE_CAPTCHA and "image_data" in challenge.extra
+        return (
+            challenge.type == CaptchaType.IMAGE_CAPTCHA
+            and "image_data" in challenge.extra
+            and ("prompt" in challenge.extra or "grid_size" in challenge.extra)
+        )
 
     async def solve(self, challenge: CaptchaChallenge) -> CaptchaSolution:
         start = time.time()
@@ -134,7 +120,7 @@ class ImageClassifierSolver(BaseSolver):
     ) -> list[int]:
         import torch
 
-        model, preprocess, tokenizer, device = _get_clip_model(self.model_name)
+        model, preprocess, tokenizer, device = self.model_manager.get_clip()
 
         grid_dim = int(grid_size ** 0.5)
         if grid_dim * grid_dim != grid_size:
@@ -188,7 +174,7 @@ class ImageClassifierSolver(BaseSolver):
             "parking meter": [l for l in COMMON_RECAPTCHA_LABELS if "parking" in l],
             "palm": [l for l in COMMON_RECAPTCHA_LABELS if "palm" in l],
             "truck": [l for l in COMMON_RECAPTCHA_LABELS if "truck" in l],
-            "airplane": [l for l in HCAPTCHA_LABELS if "airplane" in l or "plane" in l],
+            "airplane": [l for l in _HCAPTCHA_LABELS if "airplane" in l or "plane" in l],
         }
 
         for key, label_set in prompt_map.items():

@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: backlink-generator
+    runtime: docker
+    plan: free
+    envVars:
+      - key: BACKLINK_HOST
+        value: 0.0.0.0

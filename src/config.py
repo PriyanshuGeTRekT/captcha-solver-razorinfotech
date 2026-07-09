@@ -1,9 +1,8 @@
-import os
 import json
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 DEFAULT_CONFIG_DIR = Path.home() / ".captcha-solver"
@@ -60,6 +59,35 @@ class SolverConfig(BaseModel):
     retry_delay_ms: int = 2000
     profiles_dir: str = str(DEFAULT_PROFILES_DIR)
     models_dir: str = str(DEFAULT_MODELS_DIR)
+
+    @field_validator("max_retries")
+    @classmethod
+    def validate_max_retries(cls, v):
+        if v < 1 or v > 20:
+            raise ValueError("max_retries must be between 1 and 20")
+        return v
+
+    @field_validator("retry_delay_ms")
+    @classmethod
+    def validate_retry_delay(cls, v):
+        if v < 100 or v > 60000:
+            raise ValueError("retry_delay_ms must be between 100 and 60000")
+        return v
+
+    @field_validator("browser_timeout_ms")
+    @classmethod
+    def validate_timeout(cls, v):
+        if v < 5000 or v > 120000:
+            raise ValueError("browser_timeout_ms must be between 5000 and 120000")
+        return v
+
+    @field_validator("audio_model_size")
+    @classmethod
+    def validate_audio_model(cls, v):
+        valid = {"tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large-v2", "large-v3"}
+        if v not in valid:
+            raise ValueError(f"audio_model_size must be one of {valid}")
+        return v
 
 
 class AppConfig(BaseModel):

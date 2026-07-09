@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
 
 from playwright.async_api import Page
 
@@ -42,14 +41,6 @@ CAPTCHA_SIGNATURES: dict[CaptchaType, dict] = {
     },
 }
 
-SITEKEY_PATTERNS = {
-    CaptchaType.RECAPTCHA_V2: re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([^"\']+)["\']'),
-    CaptchaType.RECAPTCHA_V3: re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([^"\']+)["\']'),
-    CaptchaType.RECAPTCHA_ENTERPRISE: re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([^"\']+)["\']'),
-    CaptchaType.HCAPTCHA: re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([^"\']+)["\']'),
-    CaptchaType.TURNSTILE: re.compile(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([^"\']+)["\']'),
-}
-
 
 async def detect_captcha(page: Page, page_url: str) -> CaptchaChallenge:
     challenge = CaptchaChallenge(page_url=page_url)
@@ -60,29 +51,53 @@ async def detect_captcha(page: Page, page_url: str) -> CaptchaChallenge:
         if (typeof grecaptcha !== 'undefined') types.push('grecaptcha');
         if (typeof hcaptcha !== 'undefined') types.push('hcaptcha');
         if (typeof turnstile !== 'undefined') types.push('turnstile');
+
         const scripts = Array.from(document.querySelectorAll('script')).map(s => s.src).join('|');
-        const pageSource = document.documentElement.outerHTML;
-        return { types, scripts, pageSource };
+
+        // Extract only what we need instead of full page source
+        const sitekeyEl = document.querySelector('[data-sitekey]');
+        const sitekey = sitekeyEl ? sitekeyEl.getAttribute('data-sitekey') : '';
+
+        const dataSEl = document.querySelector('[data-s]');
+        const dataS = dataSEl ? dataSEl.getAttribute('data-s') : '';
+
+        const actionEl = document.querySelector('[data-action]');
+        const action = actionEl ? actionEl.getAttribute('data-action') : '';
+
+        const sizeEl = document.querySelector('[data-size="invisible"]');
+        const isInvisible = !!sizeEl;
+
+        // Check for specific patterns in a limited scope (first 50KB of HTML)
+        const limitedSource = document.documentElement.outerHTML.substring(0, 50000);
+
+        const hasEnterprise = limitedSource.includes('recaptcha/enterprise.js') || limitedSource.includes('recaptcha.net');
+        const hasV3 = limitedSource.includes('recaptcha/api.js?render=') || limitedSource.includes('grecaptcha.execute');
+        const hasFuncaptcha = limitedSource.includes('funcaptcha') || limitedSource.includes('arkoselabs');
+        const hasGeetest = limitedSource.toLowerCase().includes('geetest');
+        const hasDatadome = limitedSource.toLowerCase().includes('datadome');
+        const hasMtcaptcha = limitedSource.toLowerCase().includes('mtcaptcha');
+        const hasAws = scripts.toLowerCase().includes('aws') && (limitedSource.toLowerCase().includes('captcha') || limitedSource.toLowerCase().includes('challenge'));
+
+        return { types, scripts, sitekey, dataS, action, isInvisible, hasEnterprise, hasV3, hasFuncaptcha, hasGeetest, hasDatadome, hasMtcaptcha, hasAws, limitedSource };
     })()
     """)
 
-    globals = js_result.get("types", [])
+    globals_list = js_result.get("types", [])
     scripts = js_result.get("scripts", "")
-    page_source = js_result.get("pageSource", "")
 
-    _classify_recaptcha(challenge, globals, page_source, scripts)
+    _classify_recaptcha(challenge, globals_list, js_result, scripts)
     if challenge.type != CaptchaType.UNKNOWN:
         return challenge
 
-    _classify_hcaptcha(challenge, globals, page_source)
+    _classify_hcaptcha(challenge, globals_list, js_result)
     if challenge.type != CaptchaType.UNKNOWN:
         return challenge
 
-    _classify_turnstile(challenge, globals, page_source)
+    _classify_turnstile(challenge, globals_list, js_result)
     if challenge.type != CaptchaType.UNKNOWN:
         return challenge
 
-    _classify_other(challenge, page_source, scripts)
+    _classify_other(challenge, js_result, scripts)
     if challenge.type != CaptchaType.UNKNOWN:
         return challenge
 
@@ -97,15 +112,15 @@ async def detect_captcha(page: Page, page_url: str) -> CaptchaChallenge:
 def _classify_recaptcha(
     challenge: CaptchaChallenge,
     globals: list[str],
-    page_source: str,
+    js_result: dict,
     scripts: str,
 ) -> None:
     if "grecaptcha" not in globals:
         if "recaptcha/api.js" not in scripts and "recaptcha/enterprise.js" not in scripts:
             return
 
-    is_enterprise = "recaptcha/enterprise.js" in scripts or "recaptcha.net" in page_source
-    is_v3 = "recaptcha/api.js?render=" in page_source or "grecaptcha.execute" in page_source
+    is_enterprise = js_result.get("hasEnterprise", False)
+    is_v3 = js_result.get("hasV3", False)
 
     if is_enterprise:
         challenge.type = CaptchaType.RECAPTCHA_ENTERPRISE
@@ -114,88 +129,88 @@ def _classify_recaptcha(
     elif "grecaptcha" in globals:
         challenge.type = CaptchaType.RECAPTCHA_V2
 
-    match = SITEKEY_PATTERNS.get(CaptchaType.RECAPTCHA_V2, re.compile(r'')).search(page_source)
-    if match:
-        challenge.sitekey = match.group(1)
+    sitekey = js_result.get("sitekey", "")
+    if sitekey:
+        challenge.sitekey = sitekey
 
-    s_match = re.search(r'(?:data-s|"s")\s*[:=]\s*["\']([^"\']+)["\']', page_source)
-    if s_match:
-        challenge.data_s = s_match.group(1)
-        challenge.extra["s_value"] = s_match.group(1)
+    data_s = js_result.get("dataS", "")
+    if data_s:
+        challenge.data_s = data_s
+        challenge.extra["s_value"] = data_s
 
-    action_match = re.search(r'(?:data-action|action)\s*[:=]\s*["\']([^"\']+)["\']', page_source)
-    if action_match:
-        challenge.action = action_match.group(1)
+    action = js_result.get("action", "")
+    if action:
+        challenge.action = action
 
-    challenge.is_invisible = bool(
-        re.search(r'"invisible"|data-size="invisible"', page_source)
-    )
+    challenge.is_invisible = js_result.get("isInvisible", False)
 
 
 def _classify_hcaptcha(
     challenge: CaptchaChallenge,
     globals: list[str],
-    page_source: str,
+    js_result: dict,
 ) -> None:
-    if "hcaptcha" not in globals and "hcaptcha.com" not in page_source:
+    limited_source = js_result.get("limitedSource", "")
+    if "hcaptcha" not in globals and "hcaptcha.com" not in limited_source:
         return
 
     challenge.type = CaptchaType.HCAPTCHA
-    match = SITEKEY_PATTERNS.get(CaptchaType.HCAPTCHA, re.compile(r'')).search(page_source)
-    if match:
-        challenge.sitekey = match.group(1)
+    sitekey = js_result.get("sitekey", "")
+    if sitekey:
+        challenge.sitekey = sitekey
 
-    challenge.is_invisible = bool(
-        re.search(r'"invisible"|data-size="invisible"', page_source)
-    )
+    challenge.is_invisible = js_result.get("isInvisible", False)
 
 
 def _classify_turnstile(
     challenge: CaptchaChallenge,
     globals: list[str],
-    page_source: str,
+    js_result: dict,
 ) -> None:
-    if "turnstile" not in globals and "challenges.cloudflare.com" not in page_source:
+    limited_source = js_result.get("limitedSource", "")
+    if "turnstile" not in globals and "challenges.cloudflare.com" not in limited_source:
         return
 
     challenge.type = CaptchaType.TURNSTILE
-    match = SITEKEY_PATTERNS.get(CaptchaType.TURNSTILE, re.compile(r'')).search(page_source)
-    if match:
-        challenge.sitekey = match.group(1)
+    sitekey = js_result.get("sitekey", "")
+    if sitekey:
+        challenge.sitekey = sitekey
 
 
 def _classify_other(
     challenge: CaptchaChallenge,
-    page_source: str,
+    js_result: dict,
     scripts: str,
 ) -> None:
-    if "funcaptcha" in page_source or "arkoselabs" in scripts:
+    limited_source = js_result.get("limitedSource", "")
+
+    if js_result.get("hasFuncaptcha", False) or "arkoselabs" in scripts:
         challenge.type = CaptchaType.FUNCAPTCHA
-        pk_match = re.search(r'public_key\s*[:=]\s*["\']([^"\']+)["\']', page_source)
+        pk_match = re.search(r'public_key\s*[:=]\s*["\']([^"\']+)["\']', limited_source)
         if pk_match:
             challenge.sitekey = pk_match.group(1)
         return
 
-    if "geetest" in page_source.lower() or "gt.js" in scripts:
+    if js_result.get("hasGeetest", False) or "gt.js" in scripts:
         challenge.type = CaptchaType.GEETEST_V3
-        gt_match = re.search(r'(?:gt)\s*[:=]\s*["\']([^"\']+)["\']', page_source)
+        gt_match = re.search(r'(?:gt)\s*[:=]\s*["\']([^"\']+)["\']', limited_source)
         if gt_match:
             challenge.sitekey = gt_match.group(1)
         return
 
-    if "aws" in scripts.lower() and ("captcha" in page_source.lower() or "challenge" in page_source.lower()):
+    if js_result.get("hasAws", False):
         challenge.type = CaptchaType.AWS_WAF
         return
 
-    if "datadome" in scripts.lower() or "datadome" in page_source.lower():
+    if js_result.get("hasDatadome", False):
         challenge.type = CaptchaType.DATADOME
         return
 
-    if "mtcaptcha" in scripts.lower() or "mtcaptcha" in page_source.lower():
+    if js_result.get("hasMtcaptcha", False):
         challenge.type = CaptchaType.MT_CAPTCHA
-        match = re.search(r'(?:data-sitekey|sitekey)\s*[:=]\s*["\']([^"\']+)["\']', page_source)
-        if match:
-            challenge.sitekey = match.group(1)
+        sitekey = js_result.get("sitekey", "")
+        if sitekey:
+            challenge.sitekey = sitekey
         return
 
 
@@ -203,8 +218,15 @@ async def _detect_image_captcha(page: Page) -> bool:
     try:
         img_count = await page.evaluate("""
         (() => {
-            const imgs = document.querySelectorAll('img[src*="captcha"], img[class*="captcha"], img[id*="captcha"]');
-            return imgs.length;
+            const imgs = document.querySelectorAll(
+                'img[src*="captcha"], img[class*="captcha"], img[id*="captcha"], ' +
+                'img[src*="tmp/"], img[src*="Captcha"], ' +
+                'input[type="image"][src*="tmp/"]'
+            );
+            if (imgs.length > 0) return imgs.length;
+            const captchaInput = document.querySelector('input[name="captcha"], input[name*="captcha"], input[id*="captcha"]');
+            if (captchaInput) return 1;
+            return 0;
         })()
         """)
         return int(img_count) > 0

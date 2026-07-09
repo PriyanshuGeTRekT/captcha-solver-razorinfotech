@@ -1,16 +1,27 @@
+# Backlink Generator dependencies.
+# NOTE: torch + torchvision are installed separately by run.bat / run.sh from the
+# official CPU wheel index (https://download.pytorch.org/whl/cpu) — that avoids the
+# most common fresh-machine failure. easyocr depends on torch; it is satisfied by
+# that pre-install, so torch is intentionally NOT pinned here.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
 playwright>=1.45.0
-faster-whisper>=1.0.3
-easyocr>=1.7.2
-open-clip-torch>=2.26.1
-torch>=2.3.0
-torchvision>=0.18.0
-Pillow>=10.0.0
-click>=8.1.0
 pydantic>=2.0.0
-pyyaml>=6.0.0
-httpx>=0.27.0
 numpy>=1.26.0
-opencv-python-headless>=4.9.0
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
-ruff>=0.4.0
+scipy>=1.10.0
+Pillow>=10.0.0
+# opencv-python (NOT headless) — ddddocr depends on opencv-python, and installing
+# both opencv builds clobbers cv2. Use the one build that satisfies everything.
+opencv-python>=4.9.0
+easyocr>=1.7.2
+ddddocr>=1.5.6
+pytesseract>=0.3.10
+httpx>=0.27.0
+pyyaml>=6.0.0
+click>=8.1.0
+# Optional extras (only needed for reCAPTCHA/hCaptcha audio + image-grid solving,
+# which the 5 backlink sites never use). Left installed for completeness; remove to
+# slim the install: faster-whisper, open-clip-torch, curl-cffi, playwright-stealth
+faster-whisper>=1.0.3
+open-clip-torch>=2.26.1
+curl-cffi>=0.15.0

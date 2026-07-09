@@ -21,6 +21,14 @@ venv/
 .vscode/
 *.swp
 
+# Runtime artifacts
+screenshots/
+captcha_debug/
+audit_screenshots/
+server.log
+results.json
+*.log
+
 # OS
 .DS_Store
 Thumbs.db

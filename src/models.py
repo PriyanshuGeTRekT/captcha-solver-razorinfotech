@@ -47,5 +47,11 @@ class CaptchaSolution:
     solved_via: str = ""
     attempts: int = 0
     elapsed_ms: float = 0.0
+    confidence: float = 0.0
     success: bool = False
     error: str = ""
+
+
+class RateLimitException(Exception):
+    """Raised when the captcha provider rate-limits the solver."""
+    pass

@@ -1,0 +1,75 @@
+============================================================
+  BACKLINK GENERATOR  -  HOW TO RUN
+============================================================
+
+WHAT IT DOES
+  Posts your backlink URL to 5 fixed websites automatically and
+  solves each site's captcha on its own. No manual work needed.
+
+
+------------------------------------------------------------
+FIRST TIME ON A NEW COMPUTER  (Windows)
+------------------------------------------------------------
+  1. Install Python (one time only):
+       - Go to https://www.python.org/downloads/
+       - Download the latest Windows installer and open it.
+       - On the FIRST screen, TICK the box
+             "Add python.exe to PATH"
+       - Click "Install Now" and wait until it finishes.
+
+  2. Double-click   run.bat   (in this folder).
+       - The first run downloads everything it needs.
+         This can take 10-15 minutes. Please be patient.
+       - A black window shows the progress. Keep it open.
+
+  3. When it is ready, your web browser opens automatically at
+             http://localhost:8000
+
+
+------------------------------------------------------------
+EVERYDAY USE
+------------------------------------------------------------
+  1. Double-click   run.bat
+  2. Wait a few seconds - the browser opens by itself.
+       (If the page shows an error, wait 10 seconds and refresh.)
+  3. Type your client's website into "Your backlink URL".
+  4. Click "Start generating".
+  5. Watch the Results panel:
+       - Green "Posted"  = success
+       - Amber "Working" = in progress
+       - Pink "Failed"   = could not post (rare)
+
+
+------------------------------------------------------------
+TO STOP THE APP
+------------------------------------------------------------
+  Close the black window, or press  Ctrl + C  inside it.
+
+
+------------------------------------------------------------
+MAC / LINUX
+------------------------------------------------------------
+  Open a terminal in this folder and run:   bash run.sh
+  (Everything else works the same as above.)
+
+
+------------------------------------------------------------
+IF SOMETHING GOES WRONG
+------------------------------------------------------------
+  - "Python was not found":
+        Install Python (see First Time, step 1) and make sure you
+        ticked "Add python.exe to PATH", then run run.bat again.
+  - Browser page will not load:
+        Wait about 10 seconds and refresh the page.
+  - Still stuck:
+        Send a screenshot of the black window to your developer.
+
+
+------------------------------------------------------------
+GOOD TO KNOW
+------------------------------------------------------------
+  - Keep this whole folder together. Do not move run.bat out of it.
+  - The 5 target websites are fixed and listed inside the app.
+  - Optional: installing "Tesseract-OCR" can slightly improve
+    captcha reading, but the app works fine without it.
+============================================================

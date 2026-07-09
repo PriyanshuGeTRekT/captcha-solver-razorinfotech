@@ -64,9 +64,11 @@ class ProxyManager:
         if self.config_proxy and self.config_proxy.server:
             return self.config_proxy.as_playwright()
 
-        self._proxy_pool = [
-            p for p in self._proxy_pool if await self._validate(p)
-        ]
+        validated = []
+        for p in self._proxy_pool:
+            if await self._validate(p):
+                validated.append(p)
+        self._proxy_pool = validated
 
         if not self._proxy_pool:
             await self.refresh_pool()
