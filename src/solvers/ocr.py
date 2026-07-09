@@ -748,6 +748,18 @@ class OCRSolver(BaseSolver):
         if not candidates:
             return "", "none", 0.0
 
+        # Generic Yii2 hash validation: when the page exposed a captcha hash and this
+        # is NOT one of the hand-tuned sites, use the hash (sum of lowercase char
+        # codes — the Yii2 CaptchaAction default) to confirm or lightly repair the
+        # OCR candidates. Built-in sites never reach here WITH a hash — kazan takes
+        # its own early-return path, and the others are non-Yii2 (hash is None) — so
+        # this can't regress them, it only adds accuracy for user-added Yii2 sites.
+        if site_hint == "" and captcha_hash is not None:
+            hashed = self._hash_rerank(candidates, captcha_hash)
+            if hashed:
+                logger.info(f"generic hash-validated answer: '{hashed[0]}' via {hashed[1]}")
+                return hashed
+
         for c_text, c_conf, c_engine in sorted(candidates, key=lambda x: -x[1])[:10]:
             logger.debug(f"  candidate: '{c_text}' conf={c_conf:.3f} via {c_engine}")
 
@@ -1548,6 +1560,39 @@ class OCRSolver(BaseSolver):
     def _yii2_hash(text: str) -> int:
         """Compute Yii2 captcha validation hash (sum of lowercase char codes)."""
         return sum(ord(c) for c in text.lower())
+
+    def _hash_rerank(self, candidates, captcha_hash):
+        """Use a Yii2 captcha hash to confirm or lightly repair OCR candidates on a
+        generic (user-added) site. Returns (text, engine, conf) on a hash-validated
+        answer, else None. Case-insensitive (the hash lowercases)."""
+        if captcha_hash is None or not candidates:
+            return None
+        from collections import Counter
+        # 1) Exact hash matches among the candidate pool — vote by frequency. With a
+        #    dozen binarizations x scales x engines, the correct read is often already
+        #    present; the hash simply confirms which one it is.
+        matches = [(t, c, e) for t, c, e in candidates if t and self._yii2_hash(t) == captcha_hash]
+        if matches:
+            counts = Counter(t for t, _, _ in matches)
+            best_text, cnt = counts.most_common(1)[0]
+            return (best_text, "hash_match", min(0.97, 0.85 + 0.03 * cnt))
+        # 2) Single-character confusion repair on the strongest few candidates.
+        CONFUSE = {
+            'o': '0', '0': 'o', 'l': '1', '1': 'l', 'i': '1', '5': 's', 's': '5',
+            '2': 'z', 'z': '2', 'b': '6', '6': 'b', 'g': '9', '9': 'g', 'q': 'g',
+            'a': 'e', 'e': 'a', 'n': 'm', 'm': 'n', 'u': 'v', 'v': 'u', '8': 'b',
+        }
+        for t, c, e in sorted(candidates, key=lambda x: -x[1])[:6]:
+            if not t:
+                continue
+            for i, ch in enumerate(t.lower()):
+                dst = CONFUSE.get(ch)
+                if dst:
+                    cand = t[:i] + dst + t[i + 1:]
+                    if self._yii2_hash(cand) == captcha_hash:
+                        logger.info(f"generic hash repair: '{t}' -> '{cand}'")
+                        return (cand, "hash_repair", 0.88)
+        return None
 
     def _solve_kazan(self, img: Image.Image, captcha_hash: int | None = None) -> tuple[str, str, float]:
         """Kazan-specific OCR: bold italic blue text on white background.

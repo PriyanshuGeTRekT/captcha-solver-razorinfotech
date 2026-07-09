@@ -27,6 +27,7 @@ captcha_debug/
 audit_screenshots/
 server.log
 results.json
+user_sites.json
 *.log
 
 # OS

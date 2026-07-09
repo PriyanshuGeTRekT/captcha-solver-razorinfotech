@@ -8,6 +8,7 @@ screenshots/
 captcha_debug/
 server.log
 results.json
+user_sites.json
 bench_*.py
 bench_*.json
 bench_*.txt

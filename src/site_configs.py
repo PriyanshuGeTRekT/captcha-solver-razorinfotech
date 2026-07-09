@@ -1,9 +1,16 @@
 """Per-site form field mappings and random profile data for backlink generation."""
 from __future__ import annotations
 
+import json
+import logging
 import random
-from dataclasses import dataclass, field
+import re
+import tempfile
+from dataclasses import dataclass, field, asdict, replace, fields as dc_fields
+from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("backlink_gen")
 
 
 @dataclass
@@ -26,6 +33,10 @@ class SiteFormConfig:
     skip_fields: list[str] = field(default_factory=list)  # Fields to leave empty
     rating_selector: str = ""  # CSS selector for the star/rating element to click
     rating_value: int = 0  # the rating value to set (e.g., 5 for 5 stars)
+    # True for synthesized/user-added sites: the runtime DOM auto-detector fills
+    # in any empty field name from the live page. The built-in 5 leave this False
+    # so their hand-tuned mappings are never overridden (zero regression).
+    auto_detect: bool = False
 
 
 RANDOM_NAMES = [
@@ -170,8 +181,150 @@ SITE_CONFIGS: dict[str, SiteFormConfig] = {
 }
 
 
+# ============================================================
+# User-added site registry (persisted) + generic synthesis
+# ============================================================
+#
+# The built-in SITE_CONFIGS above are immutable defaults. Sites the user adds at
+# runtime are persisted to user_sites.json and MERGED over the built-ins by
+# get_all_configs(). For any URL that matches no config at all, we synthesize a
+# permissive generic config (auto_detect=True) so the fill/submit pipeline always
+# runs — the DOM auto-detector then supplies the field names from the live page.
+
+USER_SITES_FILE = Path("user_sites.json")
+
+# Populated from disk by load_user_sites(); domain -> SiteFormConfig.
+USER_SITES: dict[str, SiteFormConfig] = {}
+
+_CONFIG_FIELD_NAMES = {f.name for f in dc_fields(SiteFormConfig)}
+
+
+def normalize_domain(url_or_host: str) -> str:
+    """Reduce a URL or host to a bare lowercase host with no scheme/www/path/port."""
+    s = (url_or_host or "").strip()
+    s = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", s)  # strip scheme
+    s = s.split("/")[0].split("?")[0].split("#")[0]      # host only
+    s = s.split("@")[-1]                                   # strip userinfo
+    s = s.split(":")[0]                                    # strip port
+    return s.replace("www.", "").strip().lower()
+
+
+def make_generic_config(url: str) -> SiteFormConfig:
+    """Synthesize a permissive default config for an unknown site.
+
+    All field-name slots are left empty so the runtime DOM auto-detector fills
+    them from the live page; captcha_field falls back to 'captcha' only if
+    detection finds nothing. success/failure keyword lists are empty on purpose —
+    the generic classifier relies on the keyword-free backlink-count-increase and
+    structural error-node signals instead of brittle per-site phrases.
+    """
+    return SiteFormConfig(
+        domain=normalize_domain(url) or url,
+        url_template=url,
+        name_field="",
+        email_field="",
+        url_field="",
+        city_field="",
+        message_field="",
+        captcha_field="",
+        submit_selector="",
+        success_keywords=[],
+        failure_keywords=[],
+        auto_detect=True,
+    )
+
+
+def _config_from_dict(data: dict) -> Optional[SiteFormConfig]:
+    """Reconstruct a SiteFormConfig from a persisted dict, ignoring unknown keys."""
+    try:
+        clean = {k: v for k, v in (data or {}).items() if k in _CONFIG_FIELD_NAMES}
+        if not clean.get("domain"):
+            return None
+        clean.setdefault("url_template", "")
+        clean.setdefault("name_field", "")
+        clean.setdefault("auto_detect", True)  # user sites always auto-detect blanks
+        return SiteFormConfig(**clean)
+    except Exception as e:
+        logger.warning(f"Skipping invalid user-site record {data!r}: {e}")
+        return None
+
+
+def load_user_sites() -> dict[str, SiteFormConfig]:
+    """Load persisted user sites from disk into USER_SITES (idempotent)."""
+    USER_SITES.clear()
+    try:
+        if USER_SITES_FILE.exists():
+            raw = json.loads(USER_SITES_FILE.read_text(encoding="utf-8"))
+            records = raw if isinstance(raw, list) else raw.get("sites", [])
+            for rec in records:
+                cfg = _config_from_dict(rec)
+                if cfg:
+                    USER_SITES[normalize_domain(cfg.domain)] = cfg
+    except Exception as e:
+        logger.error(f"Failed to load {USER_SITES_FILE}: {e} — falling back to built-ins only")
+    return USER_SITES
+
+
+def save_user_sites() -> None:
+    """Persist USER_SITES atomically (temp file + rename) to avoid corruption."""
+    try:
+        records = [asdict(cfg) for cfg in USER_SITES.values()]
+        tmp = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(USER_SITES_FILE.parent or "."),
+            prefix=".user_sites_", suffix=".tmp", delete=False,
+        )
+        try:
+            json.dump(records, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+        finally:
+            tmp.close()
+        Path(tmp.name).replace(USER_SITES_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save {USER_SITES_FILE}: {e}")
+
+
+def add_user_site(config: SiteFormConfig) -> SiteFormConfig:
+    """Register (or overwrite) a user site and persist it."""
+    config = replace(config, domain=normalize_domain(config.domain), auto_detect=True)
+    USER_SITES[config.domain] = config
+    save_user_sites()
+    return config
+
+
+def remove_user_site(domain: str) -> bool:
+    """Remove a user site by domain. Returns True if something was removed.
+
+    Only user-added sites can be removed; the built-in 5 are immutable.
+    """
+    key = normalize_domain(domain)
+    if key in USER_SITES:
+        del USER_SITES[key]
+        save_user_sites()
+        return True
+    return False
+
+
+def get_all_configs() -> dict[str, SiteFormConfig]:
+    """Merged view: built-in defaults overlaid with user-added/overridden sites."""
+    merged: dict[str, SiteFormConfig] = {normalize_domain(d): c for d, c in SITE_CONFIGS.items()}
+    merged.update(USER_SITES)
+    return merged
+
+
 def get_config_for_url(url: str) -> Optional[SiteFormConfig]:
-    for domain, config in SITE_CONFIGS.items():
-        if domain in url:
+    """Return the built-in or user config whose domain matches this URL, else None."""
+    host = normalize_domain(url)
+    merged = get_all_configs()
+    if host in merged:
+        return merged[host]
+    # Fall back to substring match (handles subdomains / path-embedded domains).
+    for domain, config in merged.items():
+        if domain and domain in url:
             return config
     return None
+
+
+def get_config_or_generic(url: str) -> SiteFormConfig:
+    """Like get_config_for_url but never None — synthesizes a generic auto-detect
+    config for unknown sites so the pipeline always runs."""
+    return get_config_for_url(url) or make_generic_config(url)

@@ -7,17 +7,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import ipaddress
 import json
 import logging
 import os
 import random
 import re
+import socket
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -41,12 +44,104 @@ LOCK = asyncio.Lock()
 PROCESSING = False
 WS_CLIENTS: list[WebSocket] = []
 SCREENSHOTS_ENABLED = True  # toggled per batch from the submit request
+# Bound how many /api/sites/detect calls can each spin up a Chromium at once, so
+# the endpoint can't be used to exhaust memory (each detect launches a browser).
+DETECT_SEMAPHORE = asyncio.Semaphore(2)
+MAX_USER_SITES = 200  # cap the persisted registry so it can't grow without bound
 
 
 class BacklinkRequest(BaseModel):
     urls: list[str]
     backlink: str
     screenshots: bool = True
+
+
+class AddSiteRequest(BaseModel):
+    url: str
+    # Optional manual overrides (advanced). Any left empty are auto-detected at
+    # post time from the live page.
+    name_field: str = ""
+    email_field: str = ""
+    url_field: str = ""
+    city_field: str = ""
+    message_field: str = ""
+    captcha_field: str = ""
+    submit_selector: str = ""
+    success_keywords: list[str] = []
+    failure_keywords: list[str] = []
+
+
+class DetectRequest(BaseModel):
+    url: str
+
+
+# Palette cycled for site dots in the UI (keeps the original 5 colours first).
+_SITE_COLORS = ["#7F77DD", "#1D9E75", "#378ADD", "#EF9F27", "#D4537E",
+                "#9B59B6", "#16A085", "#E67E22", "#2C82C9", "#C0397B"]
+
+
+def _validate_public_url(url: str) -> tuple[bool, str]:
+    """SSRF guard: only allow http(s) URLs whose host resolves to public IPs.
+
+    Blocks localhost / private / loopback / link-local / reserved ranges so the
+    headless browser can't be pointed at internal services — important once the
+    server is exposed (cloud deploy binds 0.0.0.0)."""
+    # Reject characters that make Python's urlparse and the browser's WHATWG parser
+    # disagree on the host (parser-differential SSRF). A backslash is a path
+    # separator to Chromium but not to urllib, so "https://10.0.0.1\@public.com/"
+    # would validate as public.com yet load 10.0.0.1. '@' (userinfo) and control
+    # chars/whitespace are rejected for the same defense-in-depth reason.
+    if any(c in (url or "") for c in ("\\", "@")) or any(ord(c) < 0x21 for c in (url or "")):
+        return False, "URL contains disallowed characters"
+    try:
+        p = urlparse(url if "://" in url else "https://" + url)
+    except Exception:
+        return False, "Invalid URL"
+    if p.scheme not in ("http", "https"):
+        return False, "URL must start with http:// or https://"
+    host = p.hostname
+    if not host:
+        return False, "URL has no host"
+    if host.lower() in ("localhost",) or host.lower().endswith(".local"):
+        return False, "Refusing to target a local address"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, f"Could not resolve host: {host}"
+    for info in infos:
+        ip = info[4][0]
+        try:
+            ip_obj = ipaddress.ip_address(ip.split("%")[0])
+        except Exception:
+            continue
+        if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+                or ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified):
+            return False, f"Refusing to target a private/internal address ({ip})"
+    return True, ""
+
+
+async def _attach_ssrf_guard(context) -> None:
+    """Abort any NAVIGATION whose host is not public. _validate_public_url only
+    checks the initial URL; a 3xx redirect to http://127.0.0.1/ or a cloud-metadata
+    IP would otherwise be followed by page.goto. This re-validates every hop."""
+    async def _guard(route, request):
+        try:
+            if request.is_navigation_request():
+                ok, _ = await asyncio.to_thread(_validate_public_url, request.url)
+                if not ok:
+                    logger.warning(f"SSRF guard blocked navigation to {request.url[:80]}")
+                    await route.abort()
+                    return
+        except Exception:
+            pass
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+    try:
+        await context.route("**/*", _guard)
+    except Exception as e:
+        logger.warning(f"Could not attach SSRF guard: {e}")
 
 
 # Generic validation-error phrases that appear on any site's error banner.
@@ -133,6 +228,35 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .site .nm { font-size: 12.5px; color: #3a3947; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .site.off { opacity: 0.45; }
 .site.off .nm { text-decoration: line-through; }
+.site .nm { flex: 1; }
+.site-right { display: flex; align-items: center; gap: 8px; flex: none; }
+.site .rm { border: none; background: none; color: #b7b6c4; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 4px; border-radius: 6px; flex: none; }
+.site .rm:hover { background: #FBEAF0; color: #993556; }
+.site .tag { font-size: 9.5px; font-weight: 700; letter-spacing: 0.03em; color: #8079c9; background: #EEEDFE; padding: 2px 6px; border-radius: 6px; text-transform: uppercase; flex: none; }
+.addsite { display: flex; gap: 8px; margin-bottom: 8px; }
+.addsite input { flex: 1; border: 1.5px solid #CECBF6; border-radius: 11px; padding: 9px 12px; background: #fff; font-size: 12.5px; color: #26215C; font-family: inherit; outline: none; transition: border-color 0.15s, box-shadow 0.15s; }
+.addsite input:focus { border-color: #7F77DD; box-shadow: 0 0 0 3px rgba(127,119,221,0.15); }
+.addsite input::placeholder { color: #b3b2c0; }
+.btn-mini { border: none; border-radius: 11px; padding: 9px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; background: #F1EFE8; color: #5F5E5A; transition: filter 0.15s, background 0.15s; flex: none; }
+.btn-mini:hover { background: #E7E4DA; }
+.btn-mini.primary { background: #534AB7; color: #fff; }
+.btn-mini.primary:hover { filter: brightness(1.08); }
+.btn-mini:disabled { opacity: 0.55; cursor: not-allowed; }
+.addsite-msg { font-size: 11.5px; margin-bottom: 14px; min-height: 15px; }
+.addsite-msg.err { color: #993556; }
+.addsite-msg.ok { color: #0F6E56; }
+.addsite-msg.info { color: #8a8996; }
+.detect-panel { background: #fff; border-radius: 18px; padding: 22px; max-width: 680px; width: 100%; max-height: 88vh; overflow-y: auto; }
+.detect-panel h3 { font-size: 16px; font-weight: 700; color: #26215C; margin-bottom: 4px; }
+.detect-panel .sub { font-size: 12px; color: #8a8996; margin-bottom: 14px; word-break: break-all; }
+.detect-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+.detect-fields .fld { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 10px; background: #FAFAFC; font-size: 12px; }
+.detect-fields .fld .k { color: #8a8996; width: 74px; flex: none; }
+.detect-fields .fld .v { font-family: ui-monospace, Menlo, Consolas, monospace; color: #26215C; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detect-fields .fld.miss .v { color: #c39; font-style: italic; }
+.detect-warn { font-size: 11.5px; color: #854F0B; background: #FAEEDA; border-radius: 9px; padding: 8px 11px; margin-bottom: 12px; line-height: 1.5; }
+.detect-shot { width: 100%; border-radius: 10px; border: 1px solid #EDEBF6; margin-bottom: 14px; }
+.detect-actions { display: flex; gap: 10px; }
 .switch { position: relative; display: inline-flex; width: 38px; height: 22px; margin-left: auto; flex: none; }
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
 .switch .slider { position: absolute; inset: 0; background: #CFCDda; border-radius: 999px; transition: background 0.2s; }
@@ -228,13 +352,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
         <div class="card">
             <h2><span class="hi"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg></span> Submit backlinks</h2>
             <div class="sublabel"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg> Target sites &middot; toggle to include</div>
-            <div class="sites">
-                <label class="site"><span class="dot" style="background:#7F77DD"></span><span class="nm">klubabstynenta.piekary.pl</span><span class="switch"><input type="checkbox" class="site-cb" data-url="http://www.klubabstynenta.piekary.pl/ksiega-gosci/dodaj" checked onchange="onSiteToggle(this)"><span class="slider"></span></span></label>
-                <label class="site"><span class="dot" style="background:#1D9E75"></span><span class="nm">kazan.top100lingua.ru</span><span class="switch"><input type="checkbox" class="site-cb" data-url="https://kazan.top100lingua.ru/infinity-school/anglijskij-dlja-vseh-vozrastov" checked onchange="onSiteToggle(this)"><span class="slider"></span></span></label>
-                <label class="site"><span class="dot" style="background:#378ADD"></span><span class="nm">ersterzug-hq.com</span><span class="switch"><input type="checkbox" class="site-cb" data-url="http://ersterzug-hq.com/index.php/guestbook/index/newentry" checked onchange="onSiteToggle(this)"><span class="slider"></span></span></label>
-                <label class="site"><span class="dot" style="background:#EF9F27"></span><span class="nm">geini.de</span><span class="switch"><input type="checkbox" class="site-cb" data-url="https://geini.de/index.php/guestbook/index/newentry" checked onchange="onSiteToggle(this)"><span class="slider"></span></span></label>
-                <label class="site"><span class="dot" style="background:#D4537E"></span><span class="nm">starwars-freakz.de</span><span class="switch"><input type="checkbox" class="site-cb" data-url="https://www.starwars-freakz.de/index.php?commentspage=44&amp;pollID=10&amp;site=polls&amp;sorttype=DESC" checked onchange="onSiteToggle(this)"><span class="slider"></span></span></label>
+            <div class="sites" id="sites-list"></div>
+            <div class="addsite">
+                <input id="new-site-url" type="text" placeholder="Add a site by URL — e.g. https://example.com/guestbook" onkeydown="if(event.key==='Enter'){event.preventDefault();addSite();}">
+                <button class="btn-mini" id="btn-detect" onclick="detectSite()" title="Preview the fields we'll auto-detect">Detect</button>
+                <button class="btn-mini primary" id="btn-add" onclick="addSite()">Add</button>
             </div>
+            <div class="addsite-msg info" id="addsite-msg">Paste a guestbook or comment-form URL. We auto-detect the fields &amp; captcha.</div>
             <div class="sublabel">Your backlink URL(s)</div>
             <textarea id="backlink" class="bl-input" rows="3" placeholder="https://temp.com&#10;https://another-client-site.com"></textarea>
             <div class="bl-hint">Add one URL per line &mdash; all your URLs are posted together in a single comment on each site above.</div>
@@ -267,6 +391,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 
 <div class="modal" id="screenshot-modal" onclick="this.classList.remove('active')">
     <img id="screenshot-img" src="">
+</div>
+
+<div class="modal" id="detect-modal">
+    <div class="detect-panel">
+        <h3>Detected form fields</h3>
+        <div class="sub" id="detect-url"></div>
+        <div class="detect-fields" id="detect-fields"></div>
+        <div id="detect-warnings"></div>
+        <img class="detect-shot" id="detect-shot" src="" alt="page preview" style="display:none">
+        <div class="detect-actions">
+            <button class="btn btn-primary" id="btn-confirm-add" onclick="confirmAddDetected()">Add this site</button>
+            <button class="btn btn-ghost" onclick="closeDetect()">Cancel</button>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -325,6 +463,113 @@ function selectedUrls() {
     return Array.from(document.querySelectorAll('.site-cb'))
         .filter(cb => cb.checked)
         .map(cb => cb.dataset.url);
+}
+
+// ---- Dynamic site list (built-in + user-added) ----
+function setMsg(text, cls) {
+    const el = document.getElementById('addsite-msg');
+    el.className = 'addsite-msg ' + (cls || 'info');
+    el.innerHTML = text;
+}
+
+function siteRow(s, checked) {
+    const rm = s.builtin ? '' :
+        `<button class="rm" type="button" title="Remove site" data-domain="${esc(s.domain)}">&times;</button>`;
+    const tag = s.builtin ? '' : '<span class="tag">added</span>';
+    return `<label class="site${checked ? '' : ' off'}">`
+        + `<span class="dot" style="background:${esc(s.color)}"></span>`
+        + `<span class="nm" title="${esc(s.url)}">${esc(s.domain)}</span>`
+        + `<span class="site-right">${tag}${rm}`
+        + `<span class="switch"><input type="checkbox" class="site-cb" data-url="${esc(s.url)}" ${checked ? 'checked' : ''} onchange="onSiteToggle(this)"><span class="slider"></span></span>`
+        + `</span></label>`;
+}
+
+async function loadSites() {
+    const list = document.getElementById('sites-list');
+    // Delegated remove handler (attached once): reads the domain from data-domain,
+    // so a domain value can never break out of an inline onclick string.
+    if (!list._rmBound) {
+        list.addEventListener('click', (e) => {
+            const btn = e.target.closest('.rm');
+            if (btn) { e.preventDefault(); e.stopPropagation(); removeSite(btn.dataset.domain); }
+        });
+        list._rmBound = true;
+    }
+    // Preserve which sites the user had switched OFF across a reload.
+    const prevOff = new Set(Array.from(document.querySelectorAll('.site-cb')).filter(cb => !cb.checked).map(cb => cb.dataset.url));
+    const hadRows = document.querySelectorAll('.site-cb').length > 0;
+    try {
+        const r = await fetch('/api/sites');
+        const data = await r.json();
+        list.innerHTML = (data.sites || []).map(s => siteRow(s, hadRows ? !prevOff.has(s.url) : true)).join('');
+    } catch (e) {
+        list.innerHTML = '<div class="addsite-msg err">Could not load the site list.</div>';
+    }
+}
+
+async function addSite() {
+    const inp = document.getElementById('new-site-url');
+    const url = inp.value.trim();
+    if (!url) { setMsg('Enter a site URL first.', 'err'); return; }
+    const btn = document.getElementById('btn-add');
+    btn.disabled = true; setMsg('Adding…', 'info');
+    try {
+        const r = await fetch('/api/sites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+        const data = await r.json();
+        if (!r.ok) { setMsg(esc(data.detail || 'Could not add site.'), 'err'); }
+        else { inp.value = ''; await loadSites(); setMsg('Added <b>' + esc(data.domain) + '</b> — fields are auto-detected when you post.', 'ok'); }
+    } catch (e) { setMsg('Network error adding site.', 'err'); }
+    btn.disabled = false;
+}
+
+let _detectUrl = '';
+async function detectSite() {
+    const inp = document.getElementById('new-site-url');
+    const url = inp.value.trim();
+    if (!url) { setMsg('Enter a site URL to detect.', 'err'); return; }
+    const btn = document.getElementById('btn-detect');
+    btn.disabled = true; setMsg('Loading the page &amp; detecting fields… this can take ~15s.', 'info');
+    try {
+        const r = await fetch('/api/sites/detect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+        const data = await r.json();
+        if (!r.ok) { setMsg(esc(data.detail || 'Detection failed.'), 'err'); }
+        else { _detectUrl = url; showDetect(data); setMsg('', 'info'); }
+    } catch (e) { setMsg('Network error during detection.', 'err'); }
+    btn.disabled = false;
+}
+
+function showDetect(d) {
+    document.getElementById('detect-url').textContent = d.url || '';
+    const labels = { name: 'Name', email: 'Email', url: 'Website', city: 'City', message: 'Message', captcha: 'Captcha', captcha_hash: 'Captcha hash', submit: 'Submit btn' };
+    const f = d.fields || {};
+    document.getElementById('detect-fields').innerHTML = Object.keys(labels).map(k => {
+        const v = f[k];
+        const miss = !v;
+        const shown = v ? esc(v) : ((k === 'captcha' || k === 'captcha_hash') ? '— none —' : 'not found');
+        return `<div class="fld${miss ? ' miss' : ''}"><span class="k">${labels[k]}</span><span class="v">${shown}</span></div>`;
+    }).join('');
+    const warn = document.getElementById('detect-warnings');
+    warn.innerHTML = (d.warnings && d.warnings.length) ? '<div class="detect-warn">' + d.warnings.map(esc).join('<br>') + '</div>' : '';
+    const shot = document.getElementById('detect-shot');
+    if (d.screenshot) { shot.src = d.screenshot; shot.style.display = 'block'; } else { shot.style.display = 'none'; }
+    document.getElementById('detect-modal').classList.add('active');
+}
+
+function closeDetect() { document.getElementById('detect-modal').classList.remove('active'); }
+
+async function confirmAddDetected() {
+    closeDetect();
+    if (_detectUrl) document.getElementById('new-site-url').value = _detectUrl;
+    await addSite();
+}
+
+async function removeSite(domain) {
+    if (!confirm('Remove ' + domain + ' from the list?')) return;
+    try {
+        const r = await fetch('/api/sites/' + encodeURIComponent(domain), { method: 'DELETE' });
+        if (r.ok) { await loadSites(); setMsg('Removed ' + esc(domain) + '.', 'ok'); }
+        else { const d = await r.json(); setMsg(esc(d.detail || 'Could not remove site.'), 'err'); }
+    } catch (e) { setMsg('Network error removing site.', 'err'); }
 }
 
 async function submitBacklinks() {
@@ -409,7 +654,8 @@ function clearAll() {
     document.getElementById('progress-fill').style.width = '0%';
 }
 
-// Initial load via WebSocket
+// Initial load
+loadSites();
 connectWebSocket();
 </script>
 </body>
@@ -424,8 +670,8 @@ async def index():
 
 @app.get("/api/results")
 async def get_results():
-    from src.site_configs import SITE_CONFIGS
-    total_configured = len(SITE_CONFIGS)
+    from src.site_configs import get_all_configs
+    total_configured = len(get_all_configs())
     done = len([r for r in RESULTS if r["status"] != "processing"])
     return {
         "results": RESULTS,
@@ -434,12 +680,102 @@ async def get_results():
     }
 
 
+@app.get("/api/sites")
+async def list_sites():
+    """Merged list of built-in + user-added target sites for the UI."""
+    from src.site_configs import get_all_configs, SITE_CONFIGS, normalize_domain
+    builtin_norm = {normalize_domain(d) for d in SITE_CONFIGS}
+    sites = []
+    for i, (domain, cfg) in enumerate(get_all_configs().items()):
+        sites.append({
+            "domain": domain,
+            "url": cfg.url_template or ("https://" + domain),
+            "label": domain,
+            "color": _SITE_COLORS[i % len(_SITE_COLORS)],
+            "builtin": domain in builtin_norm,
+        })
+    return {"sites": sites}
+
+
+@app.post("/api/sites")
+async def add_site(req: AddSiteRequest):
+    """Register (and persist) a new target site by URL, with optional overrides."""
+    from src.site_configs import add_user_site, SiteFormConfig, normalize_domain, SITE_CONFIGS
+    url = (req.url or "").strip()
+    if not url:
+        raise HTTPException(400, "URL is required")
+    if "://" not in url:
+        url = "https://" + url
+    ok, msg = await asyncio.to_thread(_validate_public_url, url)
+    if not ok:
+        raise HTTPException(400, msg)
+    domain = normalize_domain(url)
+    if not domain:
+        raise HTTPException(400, "Could not parse a domain from the URL")
+    if domain in {normalize_domain(d) for d in SITE_CONFIGS}:
+        raise HTTPException(400, f"'{domain}' is a built-in site — it's already available")
+    from src.site_configs import USER_SITES
+    if domain not in USER_SITES and len(USER_SITES) >= MAX_USER_SITES:
+        raise HTTPException(400, f"Site limit reached ({MAX_USER_SITES}). Remove a site first.")
+    cfg = SiteFormConfig(
+        domain=domain, url_template=url,
+        name_field=req.name_field.strip(), email_field=req.email_field.strip(),
+        url_field=req.url_field.strip(), city_field=req.city_field.strip(),
+        message_field=req.message_field.strip(), captcha_field=req.captcha_field.strip(),
+        submit_selector=req.submit_selector.strip(),
+        success_keywords=[k for k in (req.success_keywords or []) if k.strip()],
+        failure_keywords=[k for k in (req.failure_keywords or []) if k.strip()],
+        auto_detect=True,
+    )
+    saved = add_user_site(cfg)
+    logger.info(f"User added site: {saved.domain} ({url})")
+    return {"status": "ok", "domain": saved.domain, "url": saved.url_template}
+
+
+@app.delete("/api/sites/{domain}")
+async def delete_site(domain: str):
+    """Remove a user-added site. Built-in sites are immutable."""
+    from src.site_configs import remove_user_site, SITE_CONFIGS, normalize_domain
+    if normalize_domain(domain) in {normalize_domain(d) for d in SITE_CONFIGS}:
+        raise HTTPException(400, "Built-in sites can't be removed")
+    if remove_user_site(domain):
+        return {"status": "ok"}
+    raise HTTPException(404, "Site not found")
+
+
+@app.post("/api/sites/detect")
+async def detect_site(req: DetectRequest):
+    """Load a URL, auto-detect its form fields, and return a preview + screenshot."""
+    url = (req.url or "").strip()
+    if not url:
+        raise HTTPException(400, "URL is required")
+    if "://" not in url:
+        url = "https://" + url
+    ok, msg = await asyncio.to_thread(_validate_public_url, url)
+    if not ok:
+        raise HTTPException(400, msg)
+    if DETECT_SEMAPHORE.locked():
+        logger.info("Detect queue busy — waiting for a slot")
+    async with DETECT_SEMAPHORE:
+        try:
+            return await _detect_site_fields(url)
+        except Exception as e:
+            logger.error(f"Detect failed for {url}: {e}")
+            raise HTTPException(502, f"Could not load or analyze the page: {str(e)[:120]}")
+
+
 @app.post("/api/submit")
 async def submit_backlinks(req: BacklinkRequest):
     global BACKLINK_QUEUE, RESULTS, PROCESSING, SCREENSHOTS_ENABLED
 
     if not req.urls:
         raise HTTPException(400, "No URLs provided")
+
+    # SSRF guard: never let the headless browser be pointed at internal hosts.
+    for target in req.urls:
+        ok, msg = await asyncio.to_thread(_validate_public_url, target)
+        if not ok:
+            raise HTTPException(400, f"{target}: {msg}")
 
     # Support multiple client backlink URLs (one per line, or comma-separated).
     backlinks = [b.strip() for b in re.split(r"[\n,]+", req.backlink or "") if b.strip()]
@@ -538,7 +874,7 @@ async def _process_queue():
     from src.solvers.ocr import OCRSolver
     from src.utils.image import decode_image
     from src.utils.model_manager import ModelManager
-    from src.site_configs import get_config_for_url, get_random_profile
+    from src.site_configs import get_config_or_generic, get_random_profile
 
     pw = None
     browser = None
@@ -568,7 +904,9 @@ async def _process_queue():
             RESULTS[idx]["message"] = "Starting..."
             await broadcast_state()
 
-            config = get_config_for_url(url)
+            # Never None: unknown sites get a generic auto-detect config so the
+            # pipeline always runs. The built-in 5 keep their hand-tuned mappings.
+            config = get_config_or_generic(url)
             profile = get_random_profile()
 
             # Context creation wrapped so a browser-level failure marks THIS item
@@ -581,6 +919,7 @@ async def _process_queue():
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
                     ignore_https_errors=True,
                 )
+                await _attach_ssrf_guard(ctx)
                 page = await ctx.new_page()
             except Exception as ctx_err:
                 logger.error(f"Failed to open browser context for {domain}: {ctx_err}")
@@ -623,11 +962,20 @@ async def _process_queue():
                     backlink_frag = re.sub(r"^https?://(www\.)?", "", backlinks[0].strip().rstrip("/")).lower()
                 backlink_count_before = 0
                 if backlink_frag:
-                    try:
-                        _body_pre = (await page.locator("body").inner_text()).lower()
-                        backlink_count_before = _body_pre.count(backlink_frag)
-                    except Exception:
-                        pass
+                    backlink_count_before = await _count_backlink_occurrences(page, backlink_frag)
+
+                # Baseline any error/notice element ALREADY visible before we submit
+                # (e.g. a persistent cookie/GDPR banner using .alert-danger/[role=alert]).
+                # Only a NEW error after submit counts as a rejection — otherwise a
+                # permanent banner would fail every post on a user-added site.
+                visible_error_before = ""
+                if getattr(config, "auto_detect", False):
+                    visible_error_before = await _detect_visible_error(page)
+
+                # For unknown/user-added sites, resolve empty field names from the
+                # live DOM so the generic pipeline knows which inputs to fill. The
+                # built-in 5 (auto_detect=False) are returned unchanged.
+                config = await _augment_config_from_dom(page, config)
 
                 # Fill non-captcha form fields FIRST, then solve captcha right
                 # before filling it — minimizes delay between solve and submit
@@ -855,27 +1203,41 @@ async def _process_queue():
                             if kw in body_lower:
                                 fail_hit = kw
                                 break
+                    # Generic sites carry no failure-keyword list, so also look for a
+                    # visible validation-error element (language-independent). Scoped
+                    # to auto-detect sites so the tuned 5 are unaffected.
+                    if not fail_hit and getattr(config, "auto_detect", False):
+                        _err = await _detect_visible_error(page)
+                        if _err and _err != visible_error_before:
+                            fail_hit = _err
+                            logger.info(f"NEW visible error element for {domain}: {_err}")
 
-                    # 2) Only consider success signals when there is NO error banner.
+                    # STRONGEST signal: a NEW entry containing the client's backlink
+                    # appeared (count increased vs the pre-fill baseline, form values
+                    # excluded). Definitive — a real posted entry, so it OVERRIDES an
+                    # error banner (some sites show both a post and a stray notice).
+                    backlink_increased = False
+                    if backlink_frag:
+                        try:
+                            _after = await _count_backlink_occurrences(page, backlink_frag)
+                            if _after > backlink_count_before:
+                                backlink_increased = True
+                                logger.info(f"Backlink now appears {_after}x (was {backlink_count_before}) — confirmed post for {domain}")
+                        except Exception:
+                            pass
+
+                    # 2) Only consider success signals when there is NO error banner,
+                    #    unless the backlink itself confirms the post.
                     success = False
-                    if not fail_hit:
-                        # STRONGEST signal: a NEW entry containing the client's backlink
-                        # URL appeared (count increased vs the pre-fill baseline). This
-                        # is definitive — not static chrome, not guestbook history.
-                        if backlink_frag:
-                            try:
-                                if body_lower.count(backlink_frag) > backlink_count_before:
-                                    success = True
-                                    logger.info(f"Backlink now appears {body_lower.count(backlink_frag)}x (was {backlink_count_before}) — confirmed post for {domain}")
-                            except Exception:
-                                pass
-
-                        if not success:
-                            for kw in config.success_keywords:
-                                if kw.lower() in body_lower:
-                                    success = True
-                                    logger.info(f"Success keyword found: '{kw}' for {domain}")
-                                    break
+                    if backlink_increased:
+                        success = True
+                        fail_hit = ""  # a real posted entry trumps any error text
+                    if not fail_hit and not success:
+                        for kw in config.success_keywords:
+                            if kw.lower() in body_lower:
+                                success = True
+                                logger.info(f"Success keyword found: '{kw}' for {domain}")
+                                break
 
                         # If page URL changed (redirect), treat as likely success
                         if not success and not body_lower:
@@ -909,8 +1271,10 @@ async def _process_queue():
                             except Exception:
                                 pass
 
-                    # Yii2 error override: visible error-summary trumps keyword/name matches
-                    if success:
+                    # Yii2 error override: a visible error-summary trumps the weaker
+                    # keyword/Yii2-clean success signals — but NOT a confirmed backlink
+                    # post (that is a real entry, stronger than any error banner).
+                    if success and not backlink_increased:
                         try:
                             yii2_override = await page.evaluate("""() => {
                                 const cf = document.querySelector('.field-comment-form-new-verifycode');
@@ -1287,9 +1651,14 @@ async def _process_queue():
                                 fail_kw = next((kw for kw in config.failure_keywords if kw.lower() in body_lower), None)
                                 if not fail_kw:
                                     fail_kw = next((kw for kw in GENERIC_ERROR_PHRASES if kw in body_lower), None)
+                                if not fail_kw and getattr(config, "auto_detect", False):
+                                    _err2 = await _detect_visible_error(retry_page)
+                                    fail_kw = _err2 if (_err2 and _err2 != visible_error_before) else None
                                 # Definitive: a new occurrence of the backlink URL vs the
-                                # pre-fill baseline (same guestbook history, so comparable).
-                                backlink_increased = bool(backlink_frag) and body_lower.count(backlink_frag) > backlink_count_before
+                                # pre-fill baseline (form values excluded, so an error
+                                # re-render echoing our input can't create a false post).
+                                _after2 = await _count_backlink_occurrences(retry_page, backlink_frag) if backlink_frag else 0
+                                backlink_increased = bool(backlink_frag) and _after2 > backlink_count_before
 
                                 # Yii2: check if the captcha field exists with no error
                                 yii2_no_error = False
@@ -1310,14 +1679,19 @@ async def _process_queue():
                                 # A visible error (keyword, generic phrase, or Yii2
                                 # error-summary) overrides any success/name match.
                                 yii2_has_error = yii2_s == 'has_error'
-                                if fail_kw or yii2_has_error:
+                                if backlink_increased:
+                                    # A real posted entry — strongest signal, wins over any error text.
+                                    RESULTS[idx]["status"] = "success"
+                                    RESULTS[idx]["message"] = f"Posted! ({config.domain})"
+                                    logger.info(f"Retry success (backlink confirmed) for {domain}")
+                                elif fail_kw or yii2_has_error:
                                     RESULTS[idx]["status"] = "failed"
                                     RESULTS[idx]["message"] = "Rejected by site"
                                     logger.info(f"Retry failure: '{fail_kw or 'form error-summary'}' for {domain}")
-                                elif backlink_increased or success_kw or yii2_no_error:
+                                elif success_kw or yii2_no_error:
                                     RESULTS[idx]["status"] = "success"
                                     RESULTS[idx]["message"] = f"Posted! ({config.domain})"
-                                    logger.info(f"Retry success: backlink+={backlink_increased} kw='{success_kw}' yii2_clean={yii2_no_error} for {domain}")
+                                    logger.info(f"Retry success: kw='{success_kw}' yii2_clean={yii2_no_error} for {domain}")
                                 else:
                                     RESULTS[idx]["status"] = "unknown"
                                     RESULTS[idx]["message"] = "Submitted but couldn't verify result"
@@ -1469,6 +1843,345 @@ def _compose_backlink_content(comment, backlinks):
     primary_link = backlinks[0] if backlinks else ""   # single homepage/url field
     message_text = f"{comment}\n\n{links_block}" if links_block else comment
     return message_text, primary_link, backlinks
+
+
+async def _count_backlink_occurrences(page, frag: str) -> int:
+    """Count how many times the backlink fragment appears in the page's rendered
+    TEXT, EXCLUDING the values of form controls.
+
+    This is the definitive success signal (a new count = a newly-posted entry).
+    Excluding <textarea>/<input>/<select> matters because a validation error often
+    re-renders the form with our own input preserved — the backlink we typed would
+    otherwise be counted and mis-read as a fresh post (a false success on sites
+    that have no failure-keyword list, i.e. every user-added site)."""
+    if not frag:
+        return 0
+    try:
+        return await page.evaluate(
+            """(frag) => {
+                const clone = document.body.cloneNode(true);
+                // Strip form controls, WYSIWYG editor regions (contenteditable /
+                // CKEditor / TinyMCE / Quill), and live-preview / alert / error
+                // containers. Any of these can echo the URL we just typed; counting
+                // that echo would fake a "posted" entry (false success), especially
+                // on a REJECTED submit where the editor re-renders our input.
+                clone.querySelectorAll(
+                    'textarea, input, select, script, style, noscript, template, ' +
+                    '[contenteditable], .ck-content, .cke_editable, .mce-content-body, .ql-editor, ' +
+                    '.preview, .vorschau, [class*="preview"], .alert, [role=alert], .error, .errors'
+                ).forEach(e => e.remove());
+                const text = (clone.textContent || '').toLowerCase();
+                if (!frag) return 0;
+                let n = 0, i = 0;
+                while ((i = text.indexOf(frag, i)) !== -1) { n++; i += frag.length; }
+                return n;
+            }""",
+            frag,
+        )
+    except Exception:
+        try:
+            body = (await page.locator("body").inner_text()).lower()
+            return body.count(frag)
+        except Exception:
+            return 0
+
+
+async def _detect_visible_error(page) -> str:
+    """Return a short label if the page shows a VISIBLE, non-empty validation/error
+    element, else "". Language-independent — used only for auto-detected (user)
+    sites, which have no per-site failure-keyword list. The built-in 5 keep their
+    tuned keyword + Yii2 checks, so this can't regress them."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const sels = [
+                    '.error', '.errors', '.has-error', '.is-invalid', '.invalid-feedback',
+                    '.alert-danger', '.alert-error', '.form-error', '.field-error',
+                    '.error-summary', '.error-message', '.validation-summary-errors',
+                    '.wpcf7-not-valid-tip', '[role=alert]',
+                ];
+                for (const sel of sels) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (el.offsetParent === null) continue;             // not rendered
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) continue;
+                        const txt = (el.innerText || el.textContent || '').trim();
+                        if (txt.length >= 3) return sel + ': ' + txt.slice(0, 60);
+                    }
+                }
+                return '';
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+# JS run in the page to infer which inputs are name/email/url/city/message/captcha
+# on an unknown site. Scoped to the form that carries the captcha (or the last form
+# with a textarea) so login/search boxes elsewhere on the page are ignored.
+_FIELD_DETECT_JS = r"""
+() => {
+  const norm = s => (s || '').toLowerCase();
+  const isHidden = el => {
+    if (!el) return true;
+    const t = (el.type || '').toLowerCase();
+    if (t === 'hidden') return true;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return true;
+    if (el.offsetParent === null && st.position !== 'fixed') return true;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return true;
+    // Off-screen honeypot traps (e.g. left:-9999px / top:-9999px) are visibility:
+    // visible with a non-null offsetParent, so also reject boxes pushed off-screen.
+    if (r.right < 1 || r.bottom < 1) return true;
+    return false;
+  };
+  // 'kod' only as ALT text (a captcha label) — NOT as a src substring, which would
+  // match unrelated images like /img/kodeks.png and mis-anchor the captcha field.
+  const CAP_IMG = "img[src*='captcha' i], img[src*='securimage' i], img[alt*='captcha' i], img[alt*='kod' i], .captcha img";
+  // Split camelCase and separators so "verifyCode"/"your_nick"/"web-site" match.
+  const clean = s => (s || '').replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().replace(/[_\-.]+/g, ' ');
+  const forms = Array.from(document.querySelectorAll('form'));
+  // Score each form by how many meaningful comment-form fields it has. On a page
+  // with several forms (e.g. a shoutbox PLUS the guestbook, both with captchas)
+  // this picks the richest form — the real guestbook — not just the first one
+  // that happens to contain a captcha.
+  const scoreForm = f => {
+    let score = 0;
+    for (const el of f.querySelectorAll('input, textarea, select')) {
+      const t = (el.type || '').toLowerCase();
+      if (t === 'hidden' || t === 'submit' || t === 'button') continue;
+      const n = clean((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || ''));
+      if (t === 'email' || /\bmail\b|email/.test(n)) score += 3;
+      if (t === 'url' || /\burl\b|website|webseite|homepage|www/.test(n)) score += 2;
+      if (el.tagName === 'TEXTAREA' || /message|comment|kommentar|nachricht|\btext\b|body|content/.test(n)) score += 3;
+      if (/\bname\b|autor|\bnick\b|author|vorname/.test(n)) score += 2;
+      if (/captcha|verif|securit|\bkod\b/.test(n)) score += 1;
+    }
+    if (f.querySelector(CAP_IMG)) score += 1;
+    return score;
+  };
+  let form = null, bestScore = 0;
+  for (const f of forms) {
+    const s = scoreForm(f);
+    if (s > bestScore) { bestScore = s; form = f; }
+  }
+  if (!form) {
+    form = forms.find(f => f.querySelector('textarea')) || (forms.length ? forms[forms.length - 1] : null);
+  }
+  const root = form || document;
+
+  const result = { form_found: !!form };
+  const used = new Set();
+  const inputs = Array.from(root.querySelectorAll('input, textarea, select'));
+  const key = el => el.name || el.id || '';
+  const labelText = el => {
+    let t = '';
+    try {
+      if (el.id) { const l = root.querySelector('label[for="' + CSS.escape(el.id) + '"]'); if (l) t += ' ' + norm(l.textContent); }
+    } catch (e) {}
+    const p = el.closest ? el.closest('label') : null;
+    if (p) t += ' ' + norm(p.textContent);
+    return t;
+  };
+  // `clean` (camelCase/separator splitter) is defined above with scoreForm.
+  const toks = el => clean((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '') + ' ' +
+                     ((el.getAttribute && el.getAttribute('autocomplete')) || '')) + ' ' + labelText(el);
+  const pick = (role, test) => {
+    if (result[role]) return;
+    for (const el of inputs) {
+      if (used.has(el) || !key(el)) continue;
+      if (test(el)) { result[role] = key(el); used.add(el); return; }
+    }
+  };
+
+  pick('email', el => (el.type || '').toLowerCase() === 'email');
+  pick('email', el => !isHidden(el) && /mail|e-mail|email/.test(toks(el)));
+  pick('url', el => (el.type || '').toLowerCase() === 'url');
+  pick('url', el => !isHidden(el) && /\burl\b|website|webseite|homepage|\bwww\b|\bsite\b/.test(toks(el)));
+  pick('message', el => el.tagName === 'TEXTAREA' && !isHidden(el));
+  pick('message', el => !isHidden(el) && /message|comment|kommentar|nachricht|eintrag|tresc|beitrag|\btext\b|\bbody\b|content|otziv|feedback|сообщени|отзыв|коммент/.test(toks(el)));
+  // Fallback: a hidden <textarea> is still the message target — WYSIWYG editors
+  // (CKEditor/TinyMCE) hide the underlying textarea and show a rich-text widget,
+  // which _fill_wysiwyg_editor handles. So accept a hidden textarea too.
+  pick('message', el => el.tagName === 'TEXTAREA');
+
+  // Name and city BEFORE captcha, so the geometric captcha fallback below can't
+  // greedily consume a name/city input that sits near the captcha image.
+  pick('name', el => !isHidden(el) && ['name','nickname'].includes(norm(el.getAttribute && el.getAttribute('autocomplete'))));
+  pick('name', el => el.tagName === 'INPUT' && !isHidden(el) &&
+       /\bname\b|autor|\bnick\b|author|vorname|username|\bfio\b|\bimya\b|absender|имя|фио|\bfrom\b/.test(toks(el)) &&
+       !['email','url'].includes((el.type || '').toLowerCase()));
+  pick('city', el => el.tagName === 'INPUT' && !isHidden(el) &&
+       /\bcity\b|town|\bort\b|stadt|miasto|gorod|wohnort|город/.test(toks(el)));
+
+  // captcha answer: keyword match first (most reliable), then fall back to the
+  // visible text input physically nearest the captcha image.
+  pick('captcha', el => el.tagName === 'INPUT' && !isHidden(el) &&
+       /captcha|verif|securit|\bkod\b|\bcode\b/.test(toks(el)) &&
+       !/\bzip\b|postal|pocztow|\bplz\b|discount|coupon|promo|voucher|\bpin\b|\barea\b|phone/.test(toks(el)) &&
+       !['email','url'].includes((el.type || '').toLowerCase()));
+  const capImg = root.querySelector(CAP_IMG);
+  if (!result.captcha && capImg) {
+    const ib = capImg.getBoundingClientRect();
+    let best = null, bestD = 1e9;
+    for (const el of inputs) {
+      if (used.has(el) || !key(el) || el.tagName !== 'INPUT') continue;
+      const t = (el.type || 'text').toLowerCase();
+      if (['hidden','submit','button','checkbox','radio','email','url','file'].includes(t) || isHidden(el)) continue;
+      const b = el.getBoundingClientRect();
+      const d = Math.hypot((b.left+b.right)/2 - (ib.left+ib.right)/2, (b.top+b.bottom)/2 - (ib.top+ib.bottom)/2);
+      if (d < bestD) { bestD = d; best = el; }
+    }
+    if (best) { result.captcha = key(best); used.add(best); }
+  }
+  pick('captcha_hash', el => (el.type || '').toLowerCase() === 'hidden' &&
+       /captcha/.test(toks(el)) && /hash|secret|token|_id|hidden/.test(toks(el)));
+
+  // submit button within the target form
+  const btns = Array.from(root.querySelectorAll("input[type=submit], button[type=submit], button:not([type]), input[type=image], input[type=button]"));
+  const neg = /reset|cancel|abbrechen|clear|l[oö]schen|logout|login|anmelden|search|suche|preview|vorschau/;
+  const pos = /submit|send|senden|save|speichern|\badd\b|hinzu|\bpost\b|dodaj|eintragen|absenden|abschicken|publish|comment|kommentar|отправить/;
+  for (const b of btns) {
+    const t = norm(b.value) + ' ' + norm(b.textContent) + ' ' + norm(b.name) + ' ' + norm(b.id);
+    if (neg.test(t)) continue;
+    // A typeless <button> reflects .type==='submit', so relying on the property
+    // would pick a WYSIWYG-toolbar button. Trust an explicit type=submit/image
+    // ATTRIBUTE; for anything else require a positive submit-word match.
+    const attrType = (b.getAttribute && (b.getAttribute('type') || '') || '').toLowerCase();
+    const attrSubmit = (b.tagName === 'INPUT' && (attrType === 'submit' || attrType === 'image'))
+                    || (b.tagName === 'BUTTON' && attrType === 'submit');
+    if (attrSubmit || pos.test(t)) {
+      result.submit_name = b.name || b.id || '';
+      break;
+    }
+  }
+  return result;
+}
+"""
+
+
+async def _augment_config_from_dom(page, config):
+    """For auto-detect (user/generic) sites, resolve empty field names from the
+    live DOM. Built-in configs (auto_detect=False) are returned unchanged, so the
+    hand-tuned 5 are never affected."""
+    if not getattr(config, "auto_detect", False):
+        return config
+    try:
+        detected = await page.evaluate(_FIELD_DETECT_JS)
+    except Exception as e:
+        logger.warning(f"Field auto-detect failed for {config.domain}: {e}")
+        detected = {}
+
+    updates: dict = {}
+
+    def set_if_empty(attr, val):
+        if val and not getattr(config, attr, ""):
+            updates[attr] = val
+
+    set_if_empty("name_field", detected.get("name"))
+    set_if_empty("email_field", detected.get("email"))
+    set_if_empty("url_field", detected.get("url"))
+    set_if_empty("city_field", detected.get("city"))
+    set_if_empty("message_field", detected.get("message"))
+    set_if_empty("captcha_field", detected.get("captcha"))
+    set_if_empty("captcha_hash_field", detected.get("captcha_hash"))
+
+    submit_name = detected.get("submit_name")
+    if submit_name and not config.submit_selector:
+        updates["submit_selector"] = (
+            f"input[name='{submit_name}'], button[name='{submit_name}'], "
+            f"input[id='{submit_name}'], button[id='{submit_name}']"
+        )
+
+    # Safe fallbacks so form-scoping and message fill never break on odd pages.
+    if not config.captcha_field and not updates.get("captcha_field"):
+        updates["captcha_field"] = "captcha"
+    if not config.message_field and not updates.get("message_field"):
+        updates["message_field"] = "message"
+
+    new_config = replace(config, **updates) if updates else config
+    logger.info(
+        f"Auto-detected fields for {new_config.domain}: "
+        f"name={new_config.name_field!r} email={new_config.email_field!r} "
+        f"url={new_config.url_field!r} msg={new_config.message_field!r} "
+        f"captcha={new_config.captcha_field!r} submit={bool(new_config.submit_selector)} "
+        f"(form_found={detected.get('form_found')})"
+    )
+    return new_config
+
+
+async def _detect_site_fields(url: str) -> dict:
+    """Load a URL headless, run the field auto-detector, and return the proposed
+    mapping + a screenshot so the user can confirm before saving the site."""
+    from playwright.async_api import async_playwright
+    from src.site_configs import normalize_domain
+
+    result = {
+        "url": url, "form_found": False, "captcha_found": False,
+        "fields": {}, "screenshot": "", "warnings": [],
+    }
+    pw = await async_playwright().start()
+    try:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        ctx = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        )
+        await _attach_ssrf_guard(ctx)
+        page = await ctx.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as nav_err:
+            raise RuntimeError(f"navigation failed: {str(nav_err)[:80]}")
+        await asyncio.sleep(1.5)
+        try:
+            await _human_scroll(page)
+        except Exception:
+            pass
+
+        detected = await page.evaluate(_FIELD_DETECT_JS)
+        result["form_found"] = bool(detected.get("form_found"))
+        result["fields"] = {
+            "name": detected.get("name", ""),
+            "email": detected.get("email", ""),
+            "url": detected.get("url", ""),
+            "city": detected.get("city", ""),
+            "message": detected.get("message", ""),
+            "captcha": detected.get("captcha", ""),
+            "captcha_hash": detected.get("captcha_hash", ""),
+            "submit": detected.get("submit_name", ""),
+        }
+        result["captcha_found"] = await page.evaluate(
+            "() => !!document.querySelector(\"img[src*='captcha' i], .captcha img, img[alt*='captcha' i], img[src*='securimage' i]\")"
+        )
+
+        if not result["form_found"]:
+            result["warnings"].append("No form was found on this page — check the URL points to the form itself.")
+        if not result["fields"]["message"]:
+            result["warnings"].append("No message/comment field detected — posting may not work here.")
+        if not result["captcha_found"]:
+            result["warnings"].append("No captcha image detected (that's fine if the site has none).")
+
+        try:
+            Path("screenshots").mkdir(exist_ok=True)
+            sp = f"screenshots/detect_{normalize_domain(url)}_{int(time.time())}.png"
+            await page.screenshot(path=sp, full_page=False)
+            result["screenshot"] = f"/screenshots/{Path(sp).name}"
+        except Exception:
+            pass
+
+        await browser.close()
+    finally:
+        try:
+            await pw.stop()
+        except Exception:
+            pass
+    return result
 
 
 async def _fill_form_humanized(page, config, profile, captcha_token, backlinks, skip_captcha=False):
@@ -1639,13 +2352,21 @@ async def _fill_form_humanized(page, config, profile, captcha_token, backlinks, 
         except Exception as e:
             logger.warning(f"Rating fill failed: {e}")
 
-    # Fill remaining empty visible fields
+    # Fill remaining empty VISIBLE fields. Honeypots (bot-traps) are almost always
+    # CSS-hidden, so excluding invisible inputs here is the main defense against
+    # tripping them on an unknown site; a name blocklist is the backup.
     try:
         remaining = await (form_scope if use_form else page).evaluate("""(el) => {
             const root = el || document;
             const fields = [];
-            root.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=checkbox]):not([type=radio])').forEach(inp => {
-                if (!inp.value) fields.push(inp.name || inp.id || '');
+            root.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=checkbox]):not([type=radio]):not([type=email]):not([type=url]):not([type=file]):not([type=password])').forEach(inp => {
+                if (inp.value) return;
+                const st = window.getComputedStyle(inp);
+                if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return;
+                if (inp.offsetParent === null && st.position !== 'fixed') return;
+                const r = inp.getBoundingClientRect();
+                if (r.width < 2 || r.height < 2) return;
+                fields.push(inp.name || inp.id || '');
             });
             return fields.filter(f => f);
         }""")
@@ -1654,8 +2375,14 @@ async def _fill_form_humanized(page, config, profile, captcha_token, backlinks, 
                 config.captcha_hash_field}
         skip.update(config.honeypot_fields or [])
         skip.update(config.skip_fields or [])
+        # Generic honeypot / do-not-fill names — skipped even with no per-site config.
+        _HONEYPOT = {"bot", "honeypot", "hp", "spam", "trap", "nofill", "no_fill",
+                     "dontfill", "leaveblank", "leave_blank", "winnie"}
         for field_name in remaining:
             if field_name in skip:
+                continue
+            if field_name.lower() in _HONEYPOT:
+                logger.info(f"Skipping honeypot-like field '{field_name}'")
                 continue
             try:
                 el = locate(f"input[name='{field_name}'], textarea[name='{field_name}']")
@@ -1893,6 +2620,13 @@ SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
 # Restore the last batch's results so a restart doesn't show an empty history.
 _load_results()
+
+# Load any user-added sites from disk so they merge with the built-in 5.
+try:
+    from src.site_configs import load_user_sites
+    load_user_sites()
+except Exception as _e:
+    logger.warning(f"Could not load user sites: {_e}")
 
 
 @app.get("/screenshots/{filename}")
