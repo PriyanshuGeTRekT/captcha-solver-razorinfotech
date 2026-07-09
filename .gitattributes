@@ -1,0 +1,8 @@
+# Windows batch/cmd files MUST be CRLF — cmd.exe mis-parses LF-terminated .bat
+# files (labels/calls fail with "not recognized"), which silently breaks run.bat.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Shell scripts must stay LF.
+*.sh text eol=lf
