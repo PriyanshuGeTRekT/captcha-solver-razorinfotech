@@ -16,7 +16,11 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 
 COPY . .
 
-ENV BACKLINK_HOST=0.0.0.0
-EXPOSE 8000
+# Listen on 0.0.0.0. Default port 7860 = Hugging Face Spaces convention (matches the
+# app_port in README.md). Render/other PaaS inject their own $PORT at runtime, which
+# overrides this image ENV, so the same image works on both.
+ENV BACKLINK_HOST=0.0.0.0 \
+    PORT=7860
+EXPOSE 7860
 
 CMD ["python", "web_server.py"]
