@@ -156,6 +156,91 @@ GENERIC_ERROR_PHRASES = [
 
 RESULTS_FILE = Path("results.json")
 
+# Persistent run history — every batch is recorded so past runs survive a restart
+# (and are visible in the History tab). Written INCREMENTALLY as each site finishes,
+# so even a crash mid-run leaves a partial record.
+RUN_HISTORY_FILE = Path("run_history.json")
+RUN_HISTORY: list[dict] = []          # oldest first
+CURRENT_RUN_ID: str = ""
+MAX_HISTORY = 200
+
+
+def _domain_of(url: str) -> str:
+    try:
+        return urlparse(url).hostname.replace("www.", "") if "//" in url else url
+    except Exception:
+        return url
+
+
+def _run_counts(results: list[dict]) -> dict:
+    c = {"posted": 0, "failed": 0, "unknown": 0, "processing": 0, "queued": 0, "total": len(results)}
+    for r in results:
+        s = r.get("status", "")
+        key = "posted" if s == "success" else s
+        if key in c:
+            c[key] += 1
+    return c
+
+
+def _load_run_history() -> None:
+    global RUN_HISTORY
+    try:
+        if RUN_HISTORY_FILE.exists():
+            RUN_HISTORY = json.loads(RUN_HISTORY_FILE.read_text(encoding="utf-8")) or []
+    except Exception:
+        RUN_HISTORY = []
+
+
+def _save_run_history() -> None:
+    """Persist history atomically (temp + replace), keeping only the newest runs."""
+    global RUN_HISTORY
+    try:
+        RUN_HISTORY = RUN_HISTORY[-MAX_HISTORY:]
+        tmp = RUN_HISTORY_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(RUN_HISTORY), encoding="utf-8")
+        tmp.replace(RUN_HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def _upsert_current_run(finished: bool = False) -> None:
+    """Create/refresh the current run's record from RESULTS and persist it. Called
+    after every site so the history reflects progress even if the process dies."""
+    if not CURRENT_RUN_ID:
+        return
+    rec = next((r for r in RUN_HISTORY if r.get("id") == CURRENT_RUN_ID), None)
+    if rec is None:
+        rec = {"id": CURRENT_RUN_ID, "started_at": time.time(), "finished_at": None,
+               "backlink": (RESULTS[0]["backlink"] if RESULTS else ""), "sites": [], "counts": {}}
+        RUN_HISTORY.append(rec)
+    rec["sites"] = [{
+        "url": r["url"], "domain": _domain_of(r["url"]), "status": r["status"],
+        "message": r["message"], "captcha_token": r.get("captcha_token", ""),
+        "screenshot": r.get("screenshot", ""), "elapsed_ms": r.get("elapsed_ms", 0),
+    } for r in RESULTS]
+    rec["counts"] = _run_counts(RESULTS)
+    if finished:
+        rec["finished_at"] = time.time()
+    _save_run_history()
+
+
+def _history_stats() -> dict:
+    """Aggregate stats across all recorded runs + per-site success tallies."""
+    posted = failed = unknown = 0
+    per_site: dict[str, dict] = {}
+    for run in RUN_HISTORY:
+        for s in run.get("sites", []):
+            st = s.get("status", "")
+            ps = per_site.setdefault(s.get("domain", "?"), {"posted": 0, "failed": 0, "other": 0})
+            if st == "success":
+                posted += 1; ps["posted"] += 1
+            elif st == "failed":
+                failed += 1; ps["failed"] += 1
+            elif st in ("unknown",):
+                unknown += 1; ps["other"] += 1
+    return {"total_runs": len(RUN_HISTORY), "posted": posted, "failed": failed,
+            "unknown": unknown, "per_site": per_site}
+
 
 def _prune_dir(path: Path, keep: int = 300) -> None:
     """Keep only the newest `keep` PNGs in a dir so screenshots/captcha_debug
@@ -257,6 +342,33 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .detect-warn { font-size: 11.5px; color: #854F0B; background: #FAEEDA; border-radius: 9px; padding: 8px 11px; margin-bottom: 12px; line-height: 1.5; }
 .detect-shot { width: 100%; border-radius: 10px; border: 1px solid #EDEBF6; margin-bottom: 14px; }
 .detect-actions { display: flex; gap: 10px; }
+.tabs { display: inline-flex; gap: 4px; background: #EEEDFE; padding: 4px; border-radius: 12px; margin-bottom: 16px; }
+.tab { border: none; background: transparent; color: #6b6a86; font-size: 13.5px; font-weight: 600; padding: 8px 18px; border-radius: 9px; cursor: pointer; font-family: inherit; transition: background 0.15s, color 0.15s; }
+.tab.active { background: #fff; color: #26215C; box-shadow: 0 1px 2px rgba(38,33,92,0.08); }
+.hist-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px; }
+.hist-stat { background: #FAFAFC; border-radius: 12px; padding: 14px 16px; }
+.hist-stat .n { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
+.hist-stat .l { font-size: 12px; color: #8a8996; font-weight: 600; margin-top: 2px; }
+.hist-stat.g .n { color: #0F6E56; } .hist-stat.r .n { color: #993556; } .hist-stat.p .n { color: #534AB7; }
+.persite { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
+.persite .chip { display: flex; align-items: center; gap: 7px; background: #FAFAFC; border-radius: 999px; padding: 5px 12px; font-size: 12px; color: #3a3947; }
+.persite .chip b { color: #0F6E56; } .persite .chip .x { color: #993556; }
+.run { border: 1px solid #EDEBF6; border-radius: 14px; margin-bottom: 10px; overflow: hidden; }
+.run-head { display: flex; align-items: center; gap: 10px; padding: 13px 15px; cursor: pointer; }
+.run-head:hover { background: #FAFAFC; }
+.run-head .when { font-size: 12.5px; font-weight: 600; color: #26215C; }
+.run-head .bl { font-size: 11.5px; color: #8a8996; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.run-head .cnt { display: flex; gap: 5px; flex: none; }
+.run-head .chev { color: #b7b6c4; flex: none; transition: transform 0.15s; }
+.run.open .chev { transform: rotate(90deg); }
+.run-body { display: none; padding: 4px 15px 13px; border-top: 1px solid #F1EFF9; }
+.run.open .run-body { display: block; }
+.run-site { display: flex; align-items: center; gap: 9px; padding: 7px 0; font-size: 12.5px; border-bottom: 1px dashed #F1EFF9; }
+.run-site:last-child { border-bottom: none; }
+.run-site .rs-dom { flex: 1; color: #3a3947; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-site .rs-msg { color: #9b9aa6; font-size: 11px; }
+.hist-empty { text-align: center; color: #9b9aa6; padding: 40px 16px; font-size: 13.5px; }
+.hist-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 .switch { position: relative; display: inline-flex; width: 38px; height: 22px; margin-left: auto; flex: none; }
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
 .switch .slider { position: absolute; inset: 0; background: #CFCDda; border-radius: 999px; transition: background 0.2s; }
@@ -348,6 +460,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
         </div>
     </div>
 
+    <div class="tabs">
+        <button class="tab active" id="tab-run" onclick="switchTab('run')">New run</button>
+        <button class="tab" id="tab-history" onclick="switchTab('history')">History</button>
+    </div>
+
+    <div id="view-run">
     <div class="grid">
         <div class="card">
             <h2><span class="hi"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg></span> Submit backlinks</h2>
@@ -387,6 +505,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
             </div>
         </div>
     </div>
+    </div>
+
+    <div id="view-history" style="display:none">
+        <div class="card">
+            <h2><span class="hg"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 3 5-6"/></svg></span> Run history</h2>
+            <div class="hist-stats" id="hist-stats"></div>
+            <div class="persite" id="hist-persite"></div>
+            <div id="history-list"></div>
+            <div class="hist-actions"><button class="btn-mini" onclick="clearHistory()">Clear history</button></div>
+        </div>
+    </div>
 </div>
 
 <div class="modal" id="screenshot-modal" onclick="this.classList.remove('active')">
@@ -415,7 +544,8 @@ const IC = {
   send: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>',
   loader: '<svg class="spin" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>',
   check: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
-  alert: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>'
+  alert: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',
+  chev: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>'
 };
 const EMPTY_HTML = '<div class="empty"><span class="ei"><svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 15l6-6"/><path d="M11 6l1-1a4 4 0 0 1 6 6l-2 2"/><path d="M13 18l-1 1a4 4 0 0 1-6-6l2-2"/></svg></span><p>Enter your backlink URL and press start to see results here.</p></div>';
 function domainOf(u) { try { return new URL(u).hostname.replace(/^www\\./, ''); } catch (e) { return u; } }
@@ -443,6 +573,8 @@ function connectWebSocket() {
                 b.disabled = false;
                 b.innerHTML = IC.send + ' Start generating';
             }
+            // Keep the History tab live if it's the one being viewed.
+            if (historyVisible()) loadHistory();
         }
     };
 
@@ -572,6 +704,88 @@ async function removeSite(domain) {
     } catch (e) { setMsg('Network error removing site.', 'err'); }
 }
 
+// ---- History tab ----
+function switchTab(which) {
+    const isRun = which === 'run';
+    document.getElementById('view-run').style.display = isRun ? '' : 'none';
+    document.getElementById('view-history').style.display = isRun ? 'none' : '';
+    document.getElementById('tab-run').classList.toggle('active', isRun);
+    document.getElementById('tab-history').classList.toggle('active', !isRun);
+    if (!isRun) loadHistory();
+}
+function historyVisible() {
+    const v = document.getElementById('view-history');
+    return v && v.style.display !== 'none';
+}
+function fmtTime(epoch) {
+    if (!epoch) return '';
+    const d = new Date(epoch * 1000);
+    const diff = (Date.now() - d.getTime()) / 1000;
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff / 60) + ' min ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + ' hr ago';
+    return d.toLocaleString();
+}
+function cntBadges(c) {
+    c = c || {};
+    const p = [];
+    if (c.posted) p.push('<span class="badge ok">' + IC.check + ' ' + c.posted + '</span>');
+    if (c.failed) p.push('<span class="badge fail">' + IC.alert + ' ' + c.failed + '</span>');
+    if (c.unknown) p.push('<span class="badge queue">? ' + c.unknown + '</span>');
+    if ((c.processing || 0) + (c.queued || 0)) p.push('<span class="badge work">' + IC.loader + ' ' + ((c.processing || 0) + (c.queued || 0)) + '</span>');
+    return p.join(' ');
+}
+function siteBadge(status) {
+    if (status === 'success') return '<span class="badge ok">' + IC.check + ' Posted</span>';
+    if (status === 'failed') return '<span class="badge fail">' + IC.alert + ' Failed</span>';
+    if (status === 'processing') return '<span class="badge work">' + IC.loader + ' Working</span>';
+    if (status === 'unknown') return '<span class="badge queue">Unknown</span>';
+    return '<span class="badge queue">Queued</span>';
+}
+async function loadHistory() {
+    try {
+        const r = await fetch('/api/history');
+        renderHistory(await r.json());
+    } catch (e) {
+        document.getElementById('history-list').innerHTML = '<div class="hist-empty">Could not load history.</div>';
+    }
+}
+function renderHistory(d) {
+    const s = d.stats || {};
+    document.getElementById('hist-stats').innerHTML =
+        '<div class="hist-stat p"><div class="n">' + (s.total_runs || 0) + '</div><div class="l">Total runs</div></div>' +
+        '<div class="hist-stat g"><div class="n">' + (s.posted || 0) + '</div><div class="l">Backlinks posted</div></div>' +
+        '<div class="hist-stat r"><div class="n">' + (s.failed || 0) + '</div><div class="l">Failed attempts</div></div>';
+    const ps = s.per_site || {};
+    document.getElementById('hist-persite').innerHTML = Object.keys(ps).sort().map(dom => {
+        const v = ps[dom];
+        return '<div class="chip">' + esc(dom) + ' <b>' + v.posted + '✓</b>' + (v.failed ? ' <span class="x">' + v.failed + '✗</span>' : '') + '</div>';
+    }).join('');
+    const runs = d.runs || [];
+    if (!runs.length) {
+        document.getElementById('history-list').innerHTML = '<div class="hist-empty">No runs yet — start a run and it will show up here.</div>';
+        return;
+    }
+    document.getElementById('history-list').innerHTML = runs.map((run, i) => {
+        const sites = (run.sites || []).map(st =>
+            '<div class="run-site">' + siteBadge(st.status) + '<span class="rs-dom">' + esc(st.domain) + '</span><span class="rs-msg">' + esc(st.message || '') + '</span></div>'
+        ).join('');
+        const running = !run.finished_at;
+        return '<div class="run' + (i === 0 ? ' open' : '') + '">'
+            + '<div class="run-head" onclick="toggleRun(this)">'
+            + '<span class="chev">' + IC.chev + '</span>'
+            + '<span class="when">' + (running ? 'Running… ' : '') + fmtTime(run.started_at) + '</span>'
+            + '<span class="bl">' + esc(run.backlink || '') + '</span>'
+            + '<span class="cnt">' + cntBadges(run.counts) + '</span>'
+            + '</div><div class="run-body">' + sites + '</div></div>';
+    }).join('');
+}
+async function clearHistory() {
+    if (!confirm('Clear all run history?')) return;
+    try { await fetch('/api/history', { method: 'DELETE' }); loadHistory(); } catch (e) {}
+}
+function toggleRun(el) { el.parentElement.classList.toggle('open'); }
+
 async function submitBacklinks() {
     const urls = selectedUrls();
     const backlink = document.getElementById('backlink').value.trim();
@@ -680,6 +894,20 @@ async def get_results():
     }
 
 
+@app.get("/api/history")
+async def get_history():
+    """Past runs (newest first) + aggregate stats for the History tab."""
+    return {"runs": list(reversed(RUN_HISTORY)), "stats": _history_stats()}
+
+
+@app.delete("/api/history")
+async def clear_history():
+    global RUN_HISTORY
+    RUN_HISTORY = []
+    _save_run_history()
+    return {"status": "ok"}
+
+
 @app.get("/api/sites")
 async def list_sites():
     """Merged list of built-in + user-added target sites for the UI."""
@@ -766,7 +994,7 @@ async def detect_site(req: DetectRequest):
 
 @app.post("/api/submit")
 async def submit_backlinks(req: BacklinkRequest):
-    global BACKLINK_QUEUE, RESULTS, PROCESSING, SCREENSHOTS_ENABLED
+    global BACKLINK_QUEUE, RESULTS, PROCESSING, SCREENSHOTS_ENABLED, CURRENT_RUN_ID
 
     if not req.urls:
         raise HTTPException(400, "No URLs provided")
@@ -814,6 +1042,9 @@ async def submit_backlinks(req: BacklinkRequest):
             })
             BACKLINK_QUEUE.append({"url": url, "backlinks": backlinks})
         PROCESSING = True
+        # Open a history record for this run (persisted incrementally as it runs).
+        CURRENT_RUN_ID = f"{int(time.time() * 1000)}"
+        _upsert_current_run()
 
     asyncio.create_task(_process_queue())
     return {"status": "ok", "count": len(BACKLINK_QUEUE)}
@@ -1724,6 +1955,10 @@ async def _process_queue():
                 await ctx.close()
 
             await broadcast_state()
+            # Persist this run's progress after every site — so even if the process
+            # dies mid-batch (e.g. OOM), the History tab still shows what completed.
+            _save_results()
+            _upsert_current_run()
 
             # Brief delay between sites
             await _human_delay(1500, 3000)
@@ -1748,6 +1983,7 @@ async def _process_queue():
             pass
         PROCESSING = False
         _save_results()
+        _upsert_current_run(finished=True)
         await broadcast_state()
 
 
@@ -2618,8 +2854,9 @@ async def _human_delay(min_ms: int, max_ms: int):
 SCREENSHOTS_DIR = Path("screenshots")
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
-# Restore the last batch's results so a restart doesn't show an empty history.
+# Restore the last batch's results + full run history so a restart keeps them.
 _load_results()
+_load_run_history()
 
 # Load any user-added sites from disk so they merge with the built-in 5.
 try:

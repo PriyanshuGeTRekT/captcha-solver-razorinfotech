@@ -28,6 +28,7 @@ audit_screenshots/
 server.log
 results.json
 user_sites.json
+run_history.json
 *.log
 
 # OS

@@ -9,6 +9,7 @@ captcha_debug/
 server.log
 results.json
 user_sites.json
+run_history.json
 bench_*.py
 bench_*.json
 bench_*.txt
